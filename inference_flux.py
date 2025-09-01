@@ -25,7 +25,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
 from mindiesd import CacheAgent, CacheConfig
-from FLUX1dev import FluxPipeline
+from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
 from transformers import T5EncoderModel
@@ -166,10 +166,16 @@ def parse_arguments():
     parser.add_argument("--use_cache", action="store_true", help="turn on dit cache or not")
     parser.add_argument("--batch_size", type=int, default=1, help="prompt batch size")
     parser.add_argument("--device_type", choices=["A2-32g-single", "A2-32g-dual", "A2-64g"], default="A2-64g", help="specify device type")
+    # ======================== SP Parallel args ========================
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Ulysses degree.",
+    )
     return parser.parse_args()
 
-
-def infer(args):
+def initialize_pipeline(args):
     if args.device_type == "A2-32g-dual":
         from FLUX1dev import replace_tp_from_pretrain, replace_tp_extract_init_dict
         FluxPipeline.from_pretrained = classmethod(replace_tp_from_pretrain)
@@ -195,8 +201,25 @@ def infer(args):
         torch.npu.set_device(args.device_id)
         pipe.enable_model_cpu_offload()
     elif args.device_type == "A2-64g":
-        torch.npu.set_device(args.device_id)
-        pipe.to(f"npu:{args.device_id}")
+        if args.ulysses_degree > 1:
+            local_rank = get_local_rank()
+            world_size = get_world_size()
+            initialize_torch_distributed(local_rank, world_size)
+            if world_size != args.ulysses_degree:
+                raise ValueError(f"number of NPUs should be equal to ulysses_degree.")
+            device = torch.device(f"npu:{local_rank}")
+            pipe.to(device)
+            parallel_args = {
+                "ulysses":{
+                    "world_size": world_size,
+                    "rank": local_rank,
+                    "group": None
+                }
+            }
+            pipe = parallelize_transformer(pipe, parallel_args)
+        else:
+            torch.npu.set_device(args.device_id)
+            pipe.to(f"npu:{args.device_id}")
     else:
         pipe.to(f"npu:{local_rank}")
         pipe.text_encoder_2.to("cpu")
@@ -249,6 +272,11 @@ def infer(args):
         s_stream_agent = CacheAgent(s_stream_config)
         pipe.transformer.s_stream_agent = s_stream_agent
 
+    return pipe
+
+def infer(args):
+    pipe = initialize_pipeline(args)
+
     torch.manual_seed(args.seed)
     torch.npu.manual_seed(args.seed)
     torch.npu.manual_seed_all(args.seed)
@@ -280,6 +308,7 @@ def infer(args):
         print(f"[{infer_num+n_prompts}/{len(prompt_loader)}]: {prompts}")
         infer_num += args.batch_size
         if infer_num > 3:
+            torch.npu.synchronize()
             start_time = time.time()
 
         image = pipe(
@@ -293,6 +322,7 @@ def infer(args):
         )
 
         if infer_num > 3:
+            torch.npu.synchronize()
             end_time = time.time() - start_time
             time_consume += end_time
 
@@ -313,6 +343,7 @@ def infer(args):
         json.dump(image_info, f)
     image_time_count = len(prompt_loader) - 3
     print(f"flux pipeline time is:{time_consume/image_time_count}")
+
     return
 
 
