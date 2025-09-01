@@ -193,7 +193,47 @@ python inference_flux.py \
 - device_type: device类型，有A2-32g-single、A2-32g-dual、A2-64g三个选项
 - batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 
-### 4.2 Atlas-800I-A2-32g单卡推理性能测试
+### 4.1 Atlas-800I-A2-64g双卡推理性能测试
+1. 设置权重路径：
+```bash
+export model_path="your local flux model path"
+```
+
+2. 执行命令：
+```shell
+# 在环境中导入以下环境变量提高推理性能
+export CPU_AFFINITY_CONF=2
+export TASK_QUEUE_ENABLE=2
+
+ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 inference_flux.py \
+       --path ${model_path} \
+       --save_path "./res" \
+       --device "npu" \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --use_cache \
+       --device_type "A2-64g" \
+       --batch_size 1 \
+       --ulysses-degree 2
+```
+参数说明：
+- path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
+- save_path: 保存图像路径，默认当前文件夹下的res文件夹
+- device: 推理设备类型，默认为npu
+- prompt_path: 用于图像生成的文字描述提示的列表文件路径
+- width: 图像生成的宽度，默认1024
+- height: 图像生成的高度，默认1024
+- infer_steps: Flux图像推理步数，默认值为50
+- seed: 设置随机种子，默认值为42
+- use_cache: 是否开启dit cache近似优化
+- device_type: device类型，有A2-32g-single、A2-32g-dual、A2-64g三个选项
+- batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
+- ulysses-degree: 指定ulysses并行度
+
+### 4.3 Atlas-800I-A2-32g单卡推理性能测试
 1. 设置权重路径：
 ```bash
 export model_path="your local flux model path"
@@ -220,7 +260,7 @@ python inference_flux.py \
 ```
 参数说明参照Atlas-800I-A2-64g参数说明
 
-### 4.3 Atlas-800I-A2-32g双卡推理性能测试
+### 4.4 Atlas-800I-A2-32g双卡推理性能测试
 1. 设置权重路径：
 ```bash
 export model_path="your local flux model path"
@@ -262,8 +302,8 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inf
 - nproc_per_node:分布式推理使用的NPU数量，设置为2
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
-### 4.4 精度测试
-#### 4.4.1 ClipScore测试
+### 4.5 精度测试
+#### 4.5.1 ClipScore测试
 1.准备模型与数据集
 ```shell
 # 下载Parti数据集
@@ -337,7 +377,7 @@ python clipscore.py \
 - model_name: Clip模型名称。
 - model_weights_path: Clip模型权重文件路径。
 
-#### 4.4.2 Hpsv2精度测试
+#### 4.5.2 Hpsv2精度测试
 1.准备模型与数据集
 
 [hpsv2数据集获取](https://gitee.com/ascend/ModelZoo-PyTorch/blob/master/MindIE/MindIE-Torch/built-in/foundation/stable_diffusion_xl/hpsv2_benchmark_prompts.json)
