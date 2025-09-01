@@ -417,35 +417,67 @@ python hpsv2_score.py \
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-_GLOBAL_SEQ = dict()
-_SPLIT_SEQ = dict()
-_SPLIT_STATES = dict()
+import torch
+from .sequence_length_tracker import *
 
-def set_global_seq(tensor_name="all", seq_dim=1):
-    _GLOBAL_SEQ[tensor_name] = seq_dim
+def get_rotary_emb_sp_equal(image_rotary_emb, encoder_seq, world_size=1):
+    cos, sin = image_rotary_emb
+    cos_encoder_hidden_states = cos[:encoder_seq, ]
+    cos_hidden_states = cos[encoder_seq:, ]
+    sin_encoder_hidden_states = sin[:encoder_seq, ]
+    sin_hidden_states = sin[encoder_seq:, ]
+    # 都沿序列维度切分
+    cos_encoder_hidden_states_split, \
+        cos_hidden_states_split, \
+            sin_encoder_hidden_states_split, \
+                sin_hidden_states_split = [i.chunk(world_size, dim=0) for i in 
+                                           (cos_encoder_hidden_states, 
+                                            cos_hidden_states,
+                                            sin_encoder_hidden_states,
+                                            sin_hidden_states)]
+    new_cos_list = []
+    for i in range(world_size):
+        new_cos_list.append(cos_encoder_hidden_states_split[i])
+        new_cos_list.append(cos_hidden_states_split[i])
 
-def get_global_seq(tensor_name="all"):
-    return _GLOBAL_SEQ[tensor_name]
+    new_sin_list = []
+    for i in range(world_size):
+        new_sin_list.append(sin_encoder_hidden_states_split[i])
+        new_sin_list.append(sin_hidden_states_split[i])
+    cos_split = torch.cat(new_cos_list, dim=0).contiguous()
+    sin_split = torch.cat(new_sin_list, dim=0).contiguous()
+    image_rotary_emb_split = [cos_split, sin_split]
+    return image_rotary_emb_split
 
-def get_split_seq_list(tensor_name="all"):
-    return _SPLIT_SEQ[tensor_name]
 
-def get_split_states(tensor_name="all"):
-    return _SPLIT_STATES[tensor_name]
+def get_rotary_emb_sp_unequal(image_rotary_emb, encoder_seq, world_size=1):
+    cos, sin = image_rotary_emb
+    cos_encoder_hidden_states = cos[:encoder_seq, ]
+    cos_hidden_states = cos[encoder_seq:, ]
+    sin_encoder_hidden_states = sin[:encoder_seq, ]
+    sin_hidden_states = sin[encoder_seq:, ]
+    # 都沿序列维度切分
+    split_size_list = get_split_seq_list("img")
 
-def set_split_seq(tensor_name="all", world_size=2):
-    global_seq = get_global_seq(tensor_name)
-    if global_seq % world_size == 0:
-        split_seq = global_seq // world_size
-        split_list = [split_seq for _ in range(world_size)]
-        _SPLIT_SEQ[tensor_name] = split_list
-        _SPLIT_STATES[tensor_name] = True
-    else:
-        split_seq1 = global_seq // world_size + 1
-        split_seq2 = global_seq - split_seq1 * (world_size - 1)
-        split_list = [split_seq1 if i != (world_size - 1) else split_seq2 for i in range(world_size)]
-        _SPLIT_SEQ[tensor_name] = split_list
-        _SPLIT_STATES[tensor_name] = False
+    cos_encoder_hidden_states_split = cos_encoder_hidden_states.chunk(world_size, dim=0)
+    sin_encoder_hidden_states_split = sin_encoder_hidden_states.chunk(world_size, dim=0)
+    cos_hidden_states_split = [t.contiguous() for t in torch.split(cos_hidden_states, split_size_list, dim=0)]
+    sin_hidden_states_split = [t.contiguous() for t in torch.split(sin_hidden_states, split_size_list, dim=0)]
+
+    new_cos_list = []
+    for i in range(world_size):
+        new_cos_list.append(cos_encoder_hidden_states_split[i])
+        new_cos_list.append(cos_hidden_states_split[i])
+
+    new_sin_list = []
+    for i in range(world_size):
+        new_sin_list.append(sin_encoder_hidden_states_split[i])
+        new_sin_list.append(sin_hidden_states_split[i])
+
+    cos_split = torch.cat(new_cos_list, dim=0).contiguous()
+    sin_split = torch.cat(new_sin_list, dim=0).contiguous()
+    image_rotary_emb_split = [cos_split, sin_split]
+    return image_rotary_emb_split
 
 
 
