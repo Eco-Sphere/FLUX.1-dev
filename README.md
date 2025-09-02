@@ -444,7 +444,9 @@ python hpsv2_score.py \
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
 
 ```python
-# Copyright 2024 Black Forest Labs, The HuggingFace Team. All rights reserved.
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2024 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -457,562 +459,372 @@ python hpsv2_score.py \
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
-from typing import Any, Dict, List, Optional, Union
-import numpy as np
+import os
+import argparse
+import csv
+import json
+import time
 
 import torch
 import torch_npu
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
 
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
-from diffusers.models.activations import GEGLU, ApproximateGELU, SwiGLU, LinearActivation
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
-from diffusers.utils.torch_utils import maybe_allow_in_graph
-from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.attention_processor import AttentionProcessor
+from torch_npu.contrib import transfer_to_npu
 
-from .modeling_utils import ModelMixin
-from ..layers import FluxPosEmbed
-from ..utils import get_local_rank, get_world_size
-from ..layers import Attention, GELU
-from ..layers import FluxAttnProcessor2_0, FluxSingleAttnProcessor2_0
+from mindiesd import CacheAgent, CacheConfig
+from FLUX1dev import apply_block_level_offload
+from FLUX1dev import FluxPipeline, parallelize_transformer
+from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
+from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
+from transformers import T5EncoderModel
+
+torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-# YiYi to-do: refactor rope related functions/classes
-def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
-    assert dim % 2 == 0, "The dimension must be even."
-
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta**scale)
-
-    batch_size, seq_length = pos.shape
-    out = torch.einsum("...n,d->...nd", pos, omega)
-    cos_out = torch.cos(out)
-    sin_out = torch.sin(out)
-
-    stacked_out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
-    out = stacked_out.view(batch_size, -1, dim // 2, 2, 2)
-    return out.float()
-
-
-# YiYi to-do: refactor rope related functions/classes
-class EmbedND(nn.Module):
-    def __init__(self, dim: int, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
-        )
-        return emb.unsqueeze(1)
-
-
-@maybe_allow_in_graph
-class FluxSingleTransformerBlock(nn.Module):
-    r"""
-    A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
-
-    Reference: https://arxiv.org/abs/2403.03206
-
-    Parameters:
-        dim (`int`): The number of channels in the input and output.
-        num_attention_heads (`int`): The number of heads to use for multi-head attention.
-        attention_head_dim (`int`): The number of channels in each head.
-        context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
-            processing of `context` conditions.
-    """
-
-    def __init__(self, dim, num_attention_heads, attention_head_dim, mlp_ratio=4.0, is_tp=False):
-        super().__init__()
-        self.mlp_hidden_dim = int(dim * mlp_ratio)
-
-        self.norm = AdaLayerNormZeroSingle(dim)
-        if is_tp:
-            self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim // 2)
-            self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim // 2)
-        else:
-            self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
-            self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
-        self.act_mlp = nn.GELU(approximate="tanh")
-        self.is_tp = is_tp
-
-        processor = FluxSingleAttnProcessor2_0()
-        self.attn = Attention(
-            query_dim=dim,
-            cross_attention_dim=None,
-            dim_head=attention_head_dim,
-            heads=num_attention_heads,
-            out_dim=dim,
-            bias=True,
-            processor=processor,
-            qk_norm="rms_norm",
-            eps=1e-6,
-            pre_only=True,
-            is_tp=is_tp,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.FloatTensor,
-        temb: torch.FloatTensor,
-        image_rotary_emb=None,
-    ):
-        residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
-        if self.is_tp:
-            B, S, H = mlp_hidden_states.shape
-            mlp_hidden_states_full = torch.empty([get_world_size(), B, S, H], dtype=mlp_hidden_states.dtype, device=mlp_hidden_states.device)
-            dist.all_gather_into_tensor(mlp_hidden_states_full, mlp_hidden_states)
-            mlp_hidden_states = mlp_hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
-
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-        )
-
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        gate = gate.unsqueeze(1)
-        hidden_states = self.proj_out(hidden_states)
-        if self.is_tp:
-            B, S, H = hidden_states.shape
-            hidden_states_all = torch.empty([get_world_size(), B, S, H], dtype=mlp_hidden_states.dtype, device=mlp_hidden_states.device)
-            dist.all_gather_into_tensor(hidden_states_all, hidden_states)
-            hidden_states = hidden_states_all.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
-        hidden_states = gate * hidden_states
-        hidden_states = residual + hidden_states
-        if hidden_states.dtype == torch.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
-
-        return hidden_states
-
-
-@maybe_allow_in_graph
-class FluxTransformerBlock(nn.Module):
-    r"""
-    A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
-
-    Reference: https://arxiv.org/abs/2403.03206
-
-    Parameters:
-        dim (`int`): The number of channels in the input and output.
-        num_attention_heads (`int`): The number of heads to use for multi-head attention.
-        attention_head_dim (`int`): The number of channels in each head.
-        context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
-            processing of `context` conditions.
-    """
-
-    def __init__(self, dim, num_attention_heads, attention_head_dim, qk_norm="rms_norm", eps=1e-6, is_tp=False):
-        super().__init__()
-
-        self.norm1 = AdaLayerNormZero(dim)
-
-        self.norm1_context = AdaLayerNormZero(dim)
-
-        if hasattr(F, "scaled_dot_product_attention"):
-            processor = FluxAttnProcessor2_0()
-        else:
-            raise ValueError(
-                "The current PyTorch version does not support the `scaled_dot_product_attention` function."
-            )
-        self.attn = Attention(
-            query_dim=dim,
-            cross_attention_dim=None,
-            added_kv_proj_dim=dim,
-            dim_head=attention_head_dim,
-            heads=num_attention_heads,
-            out_dim=dim,
-            context_pre_only=False,
-            bias=True,
-            processor=processor,
-            qk_norm=qk_norm,
-            eps=eps,
-            is_tp=is_tp,
-        )
-        if is_tp:
-            out_bias = (get_local_rank() == 0)
-        else:
-            out_bias = True
-
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", out_bias=out_bias, is_tp=is_tp)
-
-        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", out_bias=out_bias, is_tp=is_tp)
-
-        # let chunk size default to None
-        self._chunk_size = None
-        self._chunk_dim = 0
-
-        self.is_tp = is_tp
-
-    def forward(
-        self,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor,
-        temb: torch.FloatTensor,
-        image_rotary_emb=None,
-        is_tp: bool = False,
-    ):
-        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
-        )
-
-        # Attention.
-        attn_output, context_attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-        )
-
-        # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
-
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-
-        ff_output = self.ff(norm_hidden_states)
-        if self.is_tp:
-            dist.all_reduce(ff_output, op=dist.ReduceOp.SUM)
-        ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-        hidden_states = hidden_states + ff_output
-
-        # Process attention outputs for the `encoder_hidden_states`.
-
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
-
-        context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        if self.is_tp:
-            dist.all_reduce(context_ff_output, op=dist.ReduceOp.SUM)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
-        if encoder_hidden_states.dtype == torch.float16:
-            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
-
-        return hidden_states, encoder_hidden_states
-
-
-class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
-    """
-    The Transformer model introduced in Flux.
-
-    Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
-
-    Parameters:
-        patch_size (`int`): Patch size to turn the input data into small patches.
-        in_channels (`int`, *optional*, defaults to 16): The number of channels in the input.
-        num_layers (`int`, *optional*, defaults to 18): The number of layers of MMDiT blocks to use.
-        num_single_layers (`int`, *optional*, defaults to 18): The number of layers of single DiT blocks to use.
-        attention_head_dim (`int`, *optional*, defaults to 64): The number of channels in each head.
-        num_attention_heads (`int`, *optional*, defaults to 18): The number of heads to use for multi-head attention.
-        joint_attention_dim (`int`, *optional*): The number of `encoder_hidden_states` dimensions to use.
-        pooled_projection_dim (`int`): Number of dimensions to use when projecting the `pooled_projections`.
-        guidance_embeds (`bool`, defaults to False): Whether to use guidance embeddings.
-    """
-
-    _supports_gradient_checkpointing = True
-
-    @register_to_config
+class PromptLoader:
     def __init__(
-        self,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 4096,
-        pooled_projection_dim: int = 768,
-        guidance_embeds: bool = False,
-        axes_dims_rope: List[int] = [16, 56, 56],
-        is_tp: bool = False,
+            self,
+            prompt_file: str,
+            prompt_file_type: str,
+            batch_size: int = 1,
+            num_images_per_prompt: int = 1,
+            max_num_prompts: int = 0
     ):
-        super().__init__()
-        self.out_channels = in_channels
-        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
+        self.check_input_isvalid(batch_size, num_images_per_prompt, max_num_prompts)
+        self.prompts = []
+        self.catagories = ['Not_specified']
+        self.batch_size = batch_size
+        self.num_images_per_prompt = num_images_per_prompt
 
-        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
-        text_time_guidance_cls = (
-            CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
-        )
-        self.time_text_embed = text_time_guidance_cls(
-            embedding_dim=self.inner_dim, pooled_projection_dim=self.config.pooled_projection_dim
-        )
-
-        self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.inner_dim)
-        self.x_embedder = torch.nn.Linear(self.config.in_channels, self.inner_dim)
-
-        self.transformer_blocks = nn.ModuleList(
-            [
-                FluxTransformerBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=self.config.num_attention_heads,
-                    attention_head_dim=self.config.attention_head_dim,
-                    is_tp=is_tp,
-                )
-                for i in range(self.config.num_layers)
-            ]
-        )
-
-        self.single_transformer_blocks = nn.ModuleList(
-            [
-                FluxSingleTransformerBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=self.config.num_attention_heads,
-                    attention_head_dim=self.config.attention_head_dim,
-                    is_tp=is_tp,
-                )
-                for i in range(self.config.num_single_layers)
-            ]
-        )
-
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
-
-        self.gradient_checkpointing = False
-
-    @property
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
-    def attn_processors(self) -> Dict[str, AttentionProcessor]:
-        r"""
-        Returns:
-            `dict` of attention processors: A dictionary containing all attention processors used in the model with
-            indexed by its weight name.
-        """
-        # set recursively
-        processors = {}
-
-        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
-            if hasattr(module, "get_processor"):
-                processors[f"{name}.processor"] = module.get_processor()
-
-            for sub_name, child in module.named_children():
-                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
-
-            return processors
-
-        for name, module in self.named_children():
-            fn_recursive_add_processors(name, module, processors)
-
-        return processors
-
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
-    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
-        r"""
-        Sets the attention processor to use to compute attention.
-
-        Parameters:
-            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
-                The instantiated processor class or a dictionary of processor classes that will be set as the processor
-                for **all** `Attention` layers.
-
-                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
-                processor. This is strongly recommended when setting trainable attention processors.
-
-        """
-        count = len(self.attn_processors.keys())
-
-        if isinstance(processor, dict) and len(processor) != count:
-            raise ValueError(
-                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
-                f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
-            )
-
-        def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
-            if hasattr(module, "set_processor"):
-                if not isinstance(processor, dict):
-                    module.set_processor(processor)
-                else:
-                    module.set_processor(processor.pop(f"{name}.processor"))
-
-            for sub_name, child in module.named_children():
-                fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
-
-        for name, module in self.named_children():
-            fn_recursive_attn_processor(name, module, processor)
-
-
-    def _set_gradient_checkpointing(self, module, value=False):
-        if hasattr(module, "gradient_checkpointing"):
-            module.gradient_checkpointing = value
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        pooled_projections: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
-        img_ids: torch.Tensor = None,
-        txt_ids: torch.Tensor = None,
-        image_rotary_emb: torch.Tensor = None,
-        guidance: torch.Tensor = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        use_cache: bool = True,
-        return_dict: bool = True,
-        step_idx: int = 0,
-    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
-        """
-        The [`FluxTransformer2DModel`] forward method.
-
-        Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
-                Input `hidden_states`.
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
-                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
-                from the embeddings of input conditions.
-            timestep ( `torch.LongTensor`):
-                Used to indicate denoising step.
-            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
-                A list of tensors that if specified are added to the residuals of transformer blocks.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
-        if joint_attention_kwargs is not None:
-            joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
+        if prompt_file_type == 'plain':
+            self.load_prompts_plain(prompt_file, max_num_prompts)
+        elif prompt_file_type == 'parti':
+            self.load_prompts_parti(prompt_file, max_num_prompts)
+        elif prompt_file_type == 'hpsv2':
+            self.load_prompts_hpsv2(max_num_prompts)
         else:
-            lora_scale = 1.0
+            print("This operation is not supported!")
 
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-                )
-        hidden_states = self.x_embedder(hidden_states)
+        self.current_id = 0
+        self.inner_id = 0
 
-        timestep = timestep.to(hidden_states.dtype) * 1000
-        if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
-        else:
-            guidance = None
-        temb = (
-            self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, pooled_projections)
+    def __len__(self):
+        return len(self.prompts) * self.num_images_per_prompt
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current_id == len(self.prompts):
+            raise StopIteration
+        
+        ret = {
+            'prompts': [],
+            'catagories': [],
+            'save_names': [],
+            'n_prompts': self.batch_size,
+        }
+        for _ in range(self.batch_size):
+            if self.current_id == len(self.prompts):
+                ret['prompts'].append('')
+                ret['save_names'].append('')
+                ret['catagories'].append('')
+                ret['n_prompts'] -= 1
+
+            else:
+                prompt, catagory_id = self.prompts[self.current_id]
+                ret['prompts'].append(prompt)
+                ret['catagories'].append(self.catagories[catagory_id])
+                ret['save_names'].append(f'{self.current_id}_{self.inner_id}')
+
+                self.inner_id += 1
+                if self.inner_id == self.num_images_per_prompt:
+                    self.inner_id = 0
+                    self.current_id += 1
+
+        return ret
+    
+    def load_prompts_plain(self, file_path: str, max_num_prompts: int):
+        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
+            for i, line in enumerate(f):
+                if max_num_prompts and i == max_num_prompts:
+                    break
+
+                prompt = line.strip()
+                self.prompts.append((prompt, 0))
+
+    def load_prompts_parti(self, file_path: str, max_num_prompts: int):
+        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
+            # Skip the first line
+            next(f)
+            tsv_file = csv.reader(f, delimiter="\t")
+            for i, line in enumerate(tsv_file):
+                if max_num_prompts and i == max_num_prompts:
+                    break
+
+                prompt = line[0]
+                catagory = line[1]
+                if catagory not in self.catagories:
+                    self.catagories.append(catagory)
+
+                catagory_id = self.catagories.index(catagory)
+                self.prompts.append((prompt, catagory_id))
+
+    def load_prompts_hpsv2(self, max_num_prompts: int):
+        with open('hpsv2_benchmark_prompts.json', 'r') as file:
+            all_prompts = json.load(file)
+        count = 0
+        for style, prompts in all_prompts.items():
+            for prompt in prompts:
+                count += 1
+                if max_num_prompts and count >= max_num_prompts:
+                    break
+
+                if style not in self.catagories:
+                    self.catagories.append(style)
+
+                catagory_id = self.catagories.index(style)
+                self.prompts.append((prompt, catagory_id))
+
+    def check_input_isvalid(self, batch_size, num_images_per_prompt, max_num_prompts):
+        if batch_size <= 0:
+            raise ValueError(f"Param batch_size invalid, expected positive value, but get {batch_size}")
+        if num_images_per_prompt <= 0:
+            raise ValueError(f"Param num_images_per_prompt invalid, expected positive value, but get {num_images_per_prompt}")
+        if max_num_prompts < 0:
+            raise ValueError(f"Param max_num_prompts invalid, expected greater than or equal to 0, \
+                                 but get {max_num_prompts}")
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, default="./flux", help="Path to the flux model directory")
+    parser.add_argument("--save_path", type=str, default="./res", help="ouput image path")
+    parser.add_argument("--device_id", type=int, default=0, help="NPU device id")
+    parser.add_argument("--device", choices=["npu", "cpu"], default="npu", help="NPU")
+    parser.add_argument("--prompt_path", type=str, default="./prompts.txt", help="input prompt text path")
+    parser.add_argument("--prompt_type", choices=["plain", "parti", "hpsv2"], default="plain", help="specify infer prompt type")
+    parser.add_argument("--num_images_per_prompt", type=int, default=1, help="specify image number every prompt generate")
+    parser.add_argument("--max_num_prompt", type=int, default=0, help="limit the prompt number[0 indicates no limit]")
+    parser.add_argument("--info_file_save_path", type=str, default="./image_info.json", help="path to save image info")
+    parser.add_argument("--width", type=int, default=1024, help='Image size width')
+    parser.add_argument("--height", type=int, default=1024, help='Image size height')  
+    parser.add_argument("--infer_steps", type=int, default=50, help="Inference steps") 
+    parser.add_argument("--seed", type=int, default=42, help="A seed for all the prompts")
+    parser.add_argument("--use_cache", action="store_true", help="turn on dit cache or not")
+    parser.add_argument("--batch_size", type=int, default=1, help="prompt batch size")
+    parser.add_argument("--device_type", choices=["A2-32g-single", "A2-32g-dual", "A2-64g"], default="A2-64g", help="specify device type")
+    # ======================== SP Parallel args ========================
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Ulysses degree.",
+    )
+    return parser.parse_args()
+
+def initialize_pipeline(args):
+    if args.device_type == "A2-32g-dual":
+        from FLUX1dev import replace_tp_from_pretrain, replace_tp_extract_init_dict
+        FluxPipeline.from_pretrained = classmethod(replace_tp_from_pretrain)
+        FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
+    
+    check_dir_safety(args.path)
+    T5_model_path = os.path.join(args.path, "text_encoder_2")
+    T5_model = T5EncoderModel.from_pretrained(T5_model_path).to(torch.bfloat16)
+    if args.device_type == "A2-32g-dual":
+        local_rank = get_local_rank()
+        world_size = get_world_size()
+        initialize_torch_distributed(local_rank, world_size)
+        import deepspeed
+        T5_model = deepspeed.init_inference(
+            T5_model,
+            tensor_parallel={"tp_size": get_world_size()},
         )
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+        T5_model.module.to("cpu")
 
-        for _, block in enumerate(self.transformer_blocks):
-            hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
-                # block.forward,
-                block,
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-            )
+    pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
 
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+    if args.device_type == "A2-32g-single":
+        torch.npu.set_device(args.device_id)
+        # pipe.enable_model_cpu_offload()
+        device = f"npu:{args.device_id}"
+        apply_block_level_offload(
+            pipe.transformer.transformer_blocks,
+            onload_device=device,
+            block_on_npu_nums=2)
+        apply_block_level_offload(
+            pipe.transformer.single_transformer_blocks,
+            onload_device=device,
+            block_on_npu_nums=2)
+        pipe.transformer.pos_embed.to(device)
+        pipe.transformer.time_text_embed.to(device)
+        pipe.transformer.context_embedder.to(device)
+        pipe.transformer.x_embedder.to(device)
+        pipe.transformer.norm_out.to(device)
+        pipe.transformer.proj_out.to(device)
+        pipe.text_encoder_2.to(device)
+        pipe.text_encoder.to(device)
+        pipe.vae.to(device)
+        
 
-        for _, block in enumerate(self.single_transformer_blocks):
-            hidden_states = self.s_stream_agent.apply(
-                # block.forward,
-                block,
-                hidden_states=hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-            )
-
-        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
-
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
-
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
-
-        if not return_dict:
-            return (output,)
-
-        return Transformer2DModelOutput(sample=output)
-
-
-class FeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        dim_out: Optional[int] = None,
-        mult: int = 4,
-        dropout: float = 0.0,
-        activation_fn: str = "geglu",
-        final_dropout: bool = False,
-        inner_dim=None,
-        bias: bool = True,
-        out_bias: bool = True,
-        is_tp: bool = True,
-    ):
-        super().__init__()
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        if activation_fn == "gelu":
-            act_fn = GELU(dim, inner_dim, bias=bias)
-        if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias, is_tp=is_tp)
-        elif activation_fn == "geglu":
-            act_fn = GEGLU(dim, inner_dim, bias=bias)
-        elif activation_fn == "geglu-approximate":
-            act_fn = ApproximateGELU(dim, inner_dim, bias=bias)
-        elif activation_fn == "swiglu":
-            act_fn = SwiGLU(dim, inner_dim, bias=bias)
-        elif activation_fn == "linear-silu":
-            act_fn = LinearActivation(dim, inner_dim, bias=bias, activation="silu")
-
-        self.net = nn.ModuleList([])
-        # project in
-        self.net.append(act_fn)
-        # project dropout
-        self.net.append(nn.Dropout(dropout))
-        # project out
-        if is_tp:
-            self.net.append(nn.Linear(inner_dim // 2, dim_out, bias=out_bias))
+    elif args.device_type == "A2-64g":
+        if args.ulysses_degree > 1:
+            local_rank = get_local_rank()
+            world_size = get_world_size()
+            initialize_torch_distributed(local_rank, world_size)
+            if world_size != args.ulysses_degree:
+                raise ValueError(f"number of NPUs should be equal to ulysses_degree.")
+            device = torch.device(f"npu:{local_rank}")
+            pipe.to(device)
+            parallel_args = {
+                "ulysses":{
+                    "world_size": world_size,
+                    "rank": local_rank,
+                    "group": None
+                }
+            }
+            pipe = parallelize_transformer(pipe, parallel_args)
         else:
-            self.net.append(nn.Linear(inner_dim, dim_out, bias=out_bias))
-        # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
-        if final_dropout:
-            self.net.append(nn.Dropout(dropout))
+            torch.npu.set_device(args.device_id)
+            pipe.to(f"npu:{args.device_id}")
+    else:
+        pipe.to(f"npu:{local_rank}")
+        pipe.text_encoder_2.to("cpu")
+        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
 
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
+    if args.use_cache:
+        d_stream_config = CacheConfig(
+            method="dit_block_cache",
+            blocks_count=19,
+            steps_count=args.infer_steps,
+            step_start=18,
+            step_interval=2,
+            block_start=5,
+            block_end=13,
+        )
+        d_stream_agent = CacheAgent(d_stream_config)
+        pipe.transformer.d_stream_agent = d_stream_agent
+        s_stream_config = CacheConfig(
+            method="dit_block_cache",
+            blocks_count=38,
+            steps_count=args.infer_steps,
+            step_start=18,
+            step_interval=2,
+            block_start=1,
+            block_end=23,
+        )
+        s_stream_agent = CacheAgent(s_stream_config)
+        pipe.transformer.s_stream_agent = s_stream_agent
+    else:
+        d_stream_config = CacheConfig(
+            method="dit_block_cache",
+            blocks_count=19,
+            steps_count=args.infer_steps,
+            step_start=args.infer_steps,
+            step_interval=2,
+            block_start=18,
+            block_end=18,
+        )
+        d_stream_agent = CacheAgent(d_stream_config)
+        pipe.transformer.d_stream_agent = d_stream_agent
+        s_stream_config = CacheConfig(
+            method="dit_block_cache",
+            blocks_count=38,
+            steps_count=args.infer_steps,
+            step_start=args.infer_steps,
+            step_interval=2,
+            block_start=37,
+            block_end=37,
+        )
+        s_stream_agent = CacheAgent(s_stream_config)
+        pipe.transformer.s_stream_agent = s_stream_agent
+
+    return pipe
+
+def infer(args):
+    pipe = initialize_pipeline(args)
+
+    torch.manual_seed(args.seed)
+    torch.npu.manual_seed(args.seed)
+    torch.npu.manual_seed_all(args.seed)
+
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path, mode=0o640)
+    check_dir_safety(args.save_path)
+
+    infer_num = 0
+    time_consume = 0
+    current_prompt = None
+    image_info = []
+    check_file_safety(args.prompt_path)
+    prompt_loader = PromptLoader(args.prompt_path,
+                                args.prompt_type,
+                                args.batch_size,
+                                args.num_images_per_prompt,
+                                args.max_num_prompt)
+    check_param_valid(args.height, args.width, args.infer_steps)
+    for _, input_info in enumerate(prompt_loader):
+        prompts = input_info['prompts']
+        save_names = input_info['save_names']
+        catagories = input_info['catagories']
+        save_names = input_info['save_names']
+        n_prompts = input_info['n_prompts']
+
+        check_prompts_valid(prompts)
+
+        print(f"[{infer_num+n_prompts}/{len(prompt_loader)}]: {prompts}")
+        infer_num += args.batch_size
+        if infer_num > 3:
+            torch.npu.synchronize()
+            start_time = time.time()
+
+        image = pipe(
+            prompts,
+            height=args.width,
+            width=args.height,
+            guidance_scale=3.5,
+            num_inference_steps=args.infer_steps,
+            max_sequence_length=512,
+            use_cache=args.use_cache,
+        )
+
+        if infer_num > 3:
+            torch.npu.synchronize()
+            end_time = time.time() - start_time
+            time_consume += end_time
+
+        for j in range(n_prompts):
+            image_save_path = os.path.join(args.save_path, f"{save_names[j]}.png")
+            image[0][j].save(image_save_path)
+
+            if current_prompt != prompts[j]:
+                current_prompt = prompts[j]
+                image_info.append({'images': [], 'prompt': current_prompt, 'category': catagories[j]})
+
+            image_info[-1]['images'].append(image_save_path)
+    
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            if os.path.exists(args.info_file_save_path):
+                os.remove(args.info_file_save_path)
+
+            with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+                json.dump(image_info, f)
+    else:
+        if os.path.exists(args.info_file_save_path):
+            os.remove(args.info_file_save_path)
+
+        with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+            json.dump(image_info, f)
+
+    image_time_count = len(prompt_loader) - 3
+    print(f"flux pipeline time is:{time_consume/image_time_count}")
+
+    return
+
+
+if __name__ == "__main__":
+    inference_args = parse_arguments()
+    infer(inference_args)
 
 ```
