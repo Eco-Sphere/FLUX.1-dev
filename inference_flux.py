@@ -202,6 +202,10 @@ def initialize_pipeline(args):
         torch.npu.set_device(args.device_id)
         # pipe.enable_model_cpu_offload()
         device = f"npu:{args.device_id}"
+        transformer = pipe.transformer
+        pipe.transformer = None
+        pipe.to(device)
+        pipe.transformer = transformer
         apply_block_level_offload(
             pipe.transformer.transformer_blocks,
             onload_device=device,
@@ -213,10 +217,6 @@ def initialize_pipeline(args):
         pipe.transformer.x_embedder.to(device)
         pipe.transformer.norm_out.to(device)
         pipe.transformer.proj_out.to(device)
-        pipe.text_encoder_2.to(device)
-        pipe.text_encoder.to(device)
-        pipe.vae.to(device)
-        
 
     elif args.device_type == "A2-64g":
         if args.ulysses_degree > 1:
