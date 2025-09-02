@@ -25,6 +25,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
 from mindiesd import CacheAgent, CacheConfig
+from FLUX1dev import apply_block_level_offload
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
@@ -199,7 +200,24 @@ def initialize_pipeline(args):
 
     if args.device_type == "A2-32g-single":
         torch.npu.set_device(args.device_id)
-        pipe.enable_model_cpu_offload()
+        # pipe.enable_model_cpu_offload()
+        device = f"npu:{args.device_id}"
+        apply_block_level_offload(
+            pipe.transformer.transformer_blocks,
+            onload_device=device,
+            block_on_npu_nums=2)
+        pipe.transformer.single_transformer_blocks.to(device)
+        pipe.transformer.pos_embed.to(device)
+        pipe.transformer.time_text_embed.to(device)
+        pipe.transformer.context_embedder.to(device)
+        pipe.transformer.x_embedder.to(device)
+        pipe.transformer.norm_out.to(device)
+        pipe.transformer.proj_out.to(device)
+        pipe.text_encoder_2.to(device)
+        pipe.text_encoder.to(device)
+        pipe.vae.to(device)
+        
+
     elif args.device_type == "A2-64g":
         if args.ulysses_degree > 1:
             local_rank = get_local_rank()
@@ -336,11 +354,20 @@ def infer(args):
 
             image_info[-1]['images'].append(image_save_path)
     
-    if os.path.exists(args.info_file_save_path):
-        os.remove(args.info_file_save_path)
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            if os.path.exists(args.info_file_save_path):
+                os.remove(args.info_file_save_path)
 
-    with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
-        json.dump(image_info, f)
+            with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+                json.dump(image_info, f)
+    else:
+        if os.path.exists(args.info_file_save_path):
+            os.remove(args.info_file_save_path)
+
+        with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+            json.dump(image_info, f)
+
     image_time_count = len(prompt_loader) - 3
     print(f"flux pipeline time is:{time_consume/image_time_count}")
 
