@@ -17,4 +17,5 @@ from .parallel import parallelize_transformer
 from .models import FluxTransformer2DModel, ModelMixin
 from .pipeline import FluxPipeline, DiffusionPipeline
 from .utils import (get_local_rank, get_world_size, initialize_torch_distributed, replace_tp_extract_init_dict,
-                    replace_tp_from_pretrain, check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety)
+                    replace_tp_from_pretrain, check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety,
+                    apply_block_level_offload)

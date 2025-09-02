@@ -485,7 +485,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
 
         for _, block in enumerate(self.transformer_blocks):
             hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
-                block.forward,
+                block,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
@@ -496,7 +496,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
 
         for _, block in enumerate(self.single_transformer_blocks):
             hidden_states = self.s_stream_agent.apply(
-                block.forward,
+                block,
                 hidden_states=hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
