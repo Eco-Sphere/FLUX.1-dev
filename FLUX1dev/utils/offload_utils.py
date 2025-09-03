@@ -18,6 +18,8 @@ import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
+from mindiesd import CacheConfig
+
 def onload_parameters_to_device(module: torch.nn.Module):
     for name, p in module.named_parameters():
         p.data.untyped_storage().resize_(p.storage_size)
@@ -85,80 +87,117 @@ class BlockOffloadHook():
     def __init__(
         self, 
         model,
-        h2d_stream,
-        d2h_stream,
-        events,
-        block_nums,
-        block_on_npu_nums,
+        onload_device: str = "npu",
+        block_on_npu_nums: int = 2,
+        cache_config: CacheConfig = None
     ) -> None:
         self.model = model
-        self.events = events
-        self.h2d_stream = h2d_stream
-        self.d2h_stream = d2h_stream
-        self.block_nums = block_nums
+        self.onload_device = onload_device
+        self.block_nums = len(self.model)
+        self.events = []
+        for _ in range(self.block_nums):
+            self.events.append(torch.npu.Event())
+        self.h2d_stream = torch.npu.Stream()
+        self.d2h_stream = torch.npu.Stream()
         self.block_on_npu_nums = block_on_npu_nums
+        self.cache_config = cache_config
+        self.use_cache = False
 
-    def onload_block_to_device(self, module: torch.nn.Module, input):
-        to_device_index = module.index + self.block_on_npu_nums
+        if self.cache_config is not None:
+            assert self.cache_config.method == "dit_block_cache"
+            assert self.cache_config.blocks_count == self.block_nums
+            self.use_cache = self.check_cache_config()
+            if self.use_cache:
+                self.set_cache_states()
+
+    def set_cache_states(self):
+        self._cur_step = 0
+        self.steps_count = self.cache_config.steps_count
+        self.block_start = self.cache_config.block_start
+        self.block_end = self.cache_config.block_end
+        self.skip_blocks = self.block_end - self.block_start
+    
+        self.block_on_npu_nums = min(self.block_on_npu_nums, self.block_start)
+
+        self.skip_steps = []
+        for cur_step in range(0, self.steps_count):
+            if cur_step >= self.cache_config.step_start:
+                diftime = cur_step - self.cache_config.step_start
+                if diftime % self.cache_config.step_interval != 0:
+                    self.skip_steps.append(cur_step)
+
+    def _counter(self, blk_idx):
+        if (blk_idx + 1) == self.block_nums:
+            self._cur_step += 1  
+            if self._cur_step == self.steps_count:
+                self._cur_step = 0  
+                
+    def check_cache_config(self):
+        if self.cache_config.step_start >= self.cache_config.steps_count or \
+            self.cache_config.step_end == self.cache_config.step_start:
+            return False
+
+        if self.cache_config.block_start >= self.cache_config.blocks_count or \
+            self.cache_config.block_end == self.cache_config.block_start:
+            return False
+        
+        if self.cache_config.step_interval == 1:
+            return False
+
+        return True
+
+    def get_next_blk_idx(self, cur_blk_idx):
+        if self.use_cache and self._cur_step in self.skip_steps:
+            next_blk_idx = cur_blk_idx + self.block_on_npu_nums
+            if next_blk_idx >= self.block_start and cur_blk_idx < self.block_end:
+                next_blk_idx = next_blk_idx + self.skip_blocks
+        else:
+            next_blk_idx = cur_blk_idx + self.block_on_npu_nums
+        return next_blk_idx
+
+    def onload_block_to_device(self, block: torch.nn.Module, input):
+        cur_blk_idx = block.index
+        next_blk_idx = self.get_next_blk_idx(cur_blk_idx)
         forward_event = torch.npu.Event()
         forward_event.record()
-        if to_device_index < self.block_nums:
+
+        if next_blk_idx < self.block_nums:
             with torch.npu.stream(self.h2d_stream):
                 self.h2d_stream.wait_event(forward_event)
-                onload_parameters_to_device(self.model[to_device_index])
-                onload_buffers_to_device(self.model[to_device_index])
-                self.events[to_device_index].record()
-        torch.npu.current_stream().wait_event(self.events[module.index])
+                onload_parameters_to_device(self.model[next_blk_idx])
+                onload_buffers_to_device(self.model[next_blk_idx])
+                self.events[next_blk_idx].record()
 
-    def offload_block_to_memory(self, module: torch.nn.Module, input, output):
-        to_device_index = module.index
-        if to_device_index >= self.block_on_npu_nums:
+        if self.use_cache:
+            self._counter(cur_blk_idx)
+        torch.npu.current_stream().wait_event(self.events[cur_blk_idx])
+
+    def offload_block_to_memory(self, block: torch.nn.Module, input, output):
+        cur_blk_idx = block.index
+        if cur_blk_idx >= self.block_on_npu_nums:
             forward_event = torch.npu.Event()
             forward_event.record()
             with torch.npu.stream(self.d2h_stream):
                 self.d2h_stream.wait_event(forward_event)  
-                offload_parameters_to_memory(module)
-                offload_buffers_to_memory(module)
+                offload_parameters_to_memory(block)
+                offload_buffers_to_memory(block)
         torch.npu.current_stream().wait_stream(self.d2h_stream)
 
+    def register_hook(self):
+        for idx, block in enumerate(self.model):
+            block.index = idx
 
+        with torch.npu.stream(self.h2d_stream):
+            for blk_idx in range(self.block_nums):
+                self.model[blk_idx].to(self.onload_device)
+                
+                if blk_idx >= self.block_on_npu_nums:
+                    initialize_parameters_on_memory(self.model[blk_idx])
+                    initialize_buffers_on_memory(self.model[blk_idx])
 
-def apply_block_level_offload(
-    module: torch.nn.Module,
-    onload_device,
-    block_on_npu_nums):
+        torch.npu.current_stream().wait_stream(self.h2d_stream)
 
-    block_nums = len(module)
-    h2d_stream = torch.npu.Stream()
-    d2h_stream = torch.npu.Stream()
-    block_on_npu_nums = block_on_npu_nums
-    events = []
-    for _ in range(block_nums):
-        events.append(torch.npu.Event())
-
-    hook = BlockOffloadHook(
-        module,
-        h2d_stream,
-        d2h_stream,
-        events,
-        block_nums,
-        block_on_npu_nums
-        )
-    
-    for idx, block in enumerate(module):
-        block.index = idx
-
-    with torch.npu.stream(h2d_stream):
-        for blk_idx in range(block_nums):
-            module[blk_idx].to(onload_device)
-            
-            if blk_idx >= block_on_npu_nums:
-                initialize_parameters_on_memory(module[blk_idx])
-                initialize_buffers_on_memory(module[blk_idx])
-
-    torch.npu.current_stream().wait_stream(h2d_stream)
-
-    for blk_idx in range(block_nums):
-        module[blk_idx].register_forward_pre_hook(hook.onload_block_to_device)  
-        if blk_idx >= block_on_npu_nums:
-            module[blk_idx].register_forward_hook(hook.offload_block_to_memory)  
+        for blk_idx in range(self.block_nums):
+            self.model[blk_idx].register_forward_pre_hook(self.onload_block_to_device)  
+            if blk_idx >= self.block_on_npu_nums:
+                self.model[blk_idx].register_forward_hook(self.offload_block_to_memory)  

@@ -25,7 +25,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
 from mindiesd import CacheAgent, CacheConfig
-from FLUX1dev import apply_block_level_offload
+from FLUX1dev import BlockOffloadHook
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
@@ -198,51 +198,6 @@ def initialize_pipeline(args):
 
     pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
 
-    if args.device_type == "A2-32g-single":
-        torch.npu.set_device(args.device_id)
-        # pipe.enable_model_cpu_offload()
-        device = f"npu:{args.device_id}"
-        transformer = pipe.transformer
-        pipe.transformer = None
-        pipe.to(device)
-        pipe.transformer = transformer
-        apply_block_level_offload(
-            pipe.transformer.transformer_blocks,
-            onload_device=device,
-            block_on_npu_nums=2)
-        pipe.transformer.single_transformer_blocks.to(device)
-        pipe.transformer.pos_embed.to(device)
-        pipe.transformer.time_text_embed.to(device)
-        pipe.transformer.context_embedder.to(device)
-        pipe.transformer.x_embedder.to(device)
-        pipe.transformer.norm_out.to(device)
-        pipe.transformer.proj_out.to(device)
-
-    elif args.device_type == "A2-64g":
-        if args.ulysses_degree > 1:
-            local_rank = get_local_rank()
-            world_size = get_world_size()
-            initialize_torch_distributed(local_rank, world_size)
-            if world_size != args.ulysses_degree:
-                raise ValueError(f"number of NPUs should be equal to ulysses_degree.")
-            device = torch.device(f"npu:{local_rank}")
-            pipe.to(device)
-            parallel_args = {
-                "ulysses":{
-                    "world_size": world_size,
-                    "rank": local_rank,
-                    "group": None
-                }
-            }
-            pipe = parallelize_transformer(pipe, parallel_args)
-        else:
-            torch.npu.set_device(args.device_id)
-            pipe.to(f"npu:{args.device_id}")
-    else:
-        pipe.to(f"npu:{local_rank}")
-        pipe.text_encoder_2.to("cpu")
-        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
-
     if args.use_cache:
         d_stream_config = CacheConfig(
             method="dit_block_cache",
@@ -289,6 +244,56 @@ def initialize_pipeline(args):
         )
         s_stream_agent = CacheAgent(s_stream_config)
         pipe.transformer.s_stream_agent = s_stream_agent
+
+    if args.device_type == "A2-32g-single":
+        torch.npu.set_device(args.device_id)
+        # pipe.enable_model_cpu_offload()
+        device = f"npu:{args.device_id}"
+        original_transformer = pipe.transformer
+        pipe.transformer = None
+        pipe.to(device)
+        pipe.transformer = original_transformer
+
+        transformer_block_hook = BlockOffloadHook(
+            pipe.transformer.transformer_blocks,
+            onload_device=device,
+            block_on_npu_nums=2,
+            cache_config=d_stream_config
+        )
+        transformer_block_hook.register_hook()
+
+        pipe.transformer.single_transformer_blocks.to(device)
+        pipe.transformer.pos_embed.to(device)
+        pipe.transformer.time_text_embed.to(device)
+        pipe.transformer.context_embedder.to(device)
+        pipe.transformer.x_embedder.to(device)
+        pipe.transformer.norm_out.to(device)
+        pipe.transformer.proj_out.to(device)
+
+    elif args.device_type == "A2-64g":
+        if args.ulysses_degree > 1:
+            local_rank = get_local_rank()
+            world_size = get_world_size()
+            initialize_torch_distributed(local_rank, world_size)
+            if world_size != args.ulysses_degree:
+                raise ValueError(f"number of NPUs should be equal to ulysses_degree.")
+            device = torch.device(f"npu:{local_rank}")
+            pipe.to(device)
+            parallel_args = {
+                "ulysses":{
+                    "world_size": world_size,
+                    "rank": local_rank,
+                    "group": None
+                }
+            }
+            pipe = parallelize_transformer(pipe, parallel_args)
+        else:
+            torch.npu.set_device(args.device_id)
+            pipe.to(f"npu:{args.device_id}")
+    else:
+        pipe.to(f"npu:{local_rank}")
+        pipe.text_encoder_2.to("cpu")
+        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
 
     return pipe
 
