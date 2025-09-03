@@ -261,14 +261,9 @@ def initialize_pipeline(args):
             cache_config=d_stream_config
         )
         transformer_block_hook.register_hook()
-
-        pipe.transformer.single_transformer_blocks.to(device)
-        pipe.transformer.pos_embed.to(device)
-        pipe.transformer.time_text_embed.to(device)
-        pipe.transformer.context_embedder.to(device)
-        pipe.transformer.x_embedder.to(device)
-        pipe.transformer.norm_out.to(device)
-        pipe.transformer.proj_out.to(device)
+        for name, module in pipe.transformer.named_children():
+            if name != "transformer_blocks":
+                module.to(device)
 
     elif args.device_type == "A2-64g":
         if args.ulysses_degree > 1:

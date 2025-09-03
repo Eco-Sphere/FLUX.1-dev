@@ -442,15 +442,3 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
-```python
-        transformer_block_hook = BlockOffloadHook(
-            pipe.transformer.transformer_blocks,
-            onload_device=device,
-            block_on_npu_nums=2,
-            cache_config=d_stream_config
-        )
-        transformer_block_hook.register_hook()
-        for name, module in pipe.transformer.named_children():
-            if name != "transformer_blocks":
-                module.to(device)
-```
