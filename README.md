@@ -443,212 +443,81 @@ python hpsv2_score.py \
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
 ```python
-#  Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+# Copyright Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
 
-import functools
-import inspect
-import fnmatch
-from typing import List, Dict, Any, Union, Callable, Tuple
-import contextvars
+from typing import List, Any, Dict, Optional, Type, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
-from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.timestep.manager import TimestepManager
-from msmodelslim.utils.logging import logger
+from msmodelslim.pytorch.llm_ptq.model.base import ModelAdapter, ModelAdapterRegistry
 
-MAX_RECURSION_DEPTH = 20
-
-
-class InputCapture:
-    """Handles capturing and storing function inputs and outputs."""
-
-    _captured_inputs_var = contextvars.ContextVar("captured_inputs", default=[])
-
-    @classmethod
-    def reset(cls) -> None:
-        """Reset all captured inputs."""
-        cls._captured_inputs_var.set([])
-
-    @classmethod
-    def get_all(cls) -> List[Dict[str, Any]]:
-        """Get all captured inputs."""
-        return cls._captured_inputs_var.get()
-
-    @classmethod
-    def add_record(cls, record: Dict[str, Any]) -> None:
-        """Add a new record to the captured inputs."""
-        inputs = cls._captured_inputs_var.get()
-        inputs.append(record)
-        cls._captured_inputs_var.set(inputs)
-
-    @classmethod
-    def capture_forward_inputs(
-            cls,
-            func: Callable,
-            capture_mode: str = 'args',
-    ) -> Callable:
-        """
-        Decorator to capture inputs to a forward function.
-
-        Args:
-            func: Forward function to decorate
-            capture_mode: 'args', 'kwargs', 'timestep'
-
-        Returns:
-            Wrapped function
-        """
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Get function signature and bind arguments
-            sig = inspect.signature(func)
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-
-            # Handle 'self' for methods
-            is_method = 'self' in sig.parameters
-            captured_args = list(bound.args[1:]) if is_method else list(bound.args)
-
-            captured_kwargs = bound.arguments.copy()
-            if is_method and 'self' in captured_kwargs:
-                del captured_kwargs['self']
-
-            # Apply capture mode
-            if capture_mode == 'args':
-                captured_kwargs = {}
-                record = captured_args
-            elif capture_mode == 'kwargs':
-                captured_args = []
-                record = captured_kwargs
-            elif capture_mode == 'timestep':
-                record = {
-                    "tag": "",
-                    "timestep_idx": TimestepManager.get_timestep_idx(),
-                    "module_name": func.__qualname__,
-                    "args": captured_args,
-                    "kwargs": captured_kwargs
-                }
-            else:
-                raise ValueError(f"Invalid capture_mode: {capture_mode}. Must be 'args' or 'kwargs' or 'timestep'")
-
-            # Execute original function
-            result = func(*args, **kwargs)
-
-            # Store record
-            record = to_device(record, device='cpu')
-            cls.add_record(record)
-
-            return result
-
-        return wrapper
+if TYPE_CHECKING:
+    from msmodelslim.pytorch.llm_ptq.anti_outlier.config import AntiOutlierConfig
 
 
-class DumperManager(nn.Module):
-    """Module that listens to and captures forward pass inputs and outputs."""
+@ModelAdapterRegistry.register("flux")
+class FluxAdapter(ModelAdapter):
+    def get_norm_linear_subgraph(self,
+                                 cfg: 'AntiOutlierConfig',
+                                 dummy_input: Optional[torch.Tensor] = None,
+                                 norm_class: Optional[List[Type[nn.Module]]] = None):
+        norm_linear = {}
+        double_layer_num = self.model.config.num_layers
+        if not isinstance(double_layer_num, int):
+            raise TypeError("num_layers must be an integer.")
+        if double_layer_num < 1 or double_layer_num > 999:
+            raise ValueError("num_layers must be in the range 1 to 999.")
 
-    def __init__(
-            self,
-            module: nn.Module,
-            capture_mode: str = 'args',
-    ):
-        """
-        Initialize a listener for the given module.
+        for layer in range(double_layer_num):
+            input_layernorm = str(layer) + 'qkv_anti'
+            q_proj = 'transformer_blocks.' + str(layer) + '.attn.to_q'
+            k_proj = 'transformer_blocks.' + str(layer) + '.attn.to_k'
+            v_proj = 'transformer_blocks.' + str(layer) + '.attn.to_v'
+            norm_linear[input_layernorm] = [q_proj, k_proj, v_proj]
 
-        Args:
-            module: Module to listen to
-            capture_mode: 'args' or 'kwargs' or 'timestep'
-        """
-        super().__init__()
-        self.module = module
-        self.capture_mode = capture_mode
-        self.old_forward = None
+            input_layernorm = str(layer) + 'qkv_context_anti'
+            add_q_proj = 'transformer_blocks.' + str(layer) + '.attn.add_q_proj'
+            add_k_proj = 'transformer_blocks.' + str(layer) + '.attn.add_k_proj'
+            add_v_proj = 'transformer_blocks.' + str(layer) + '.attn.add_v_proj'
+            norm_linear[input_layernorm] = [add_q_proj, add_k_proj, add_v_proj]
 
-        if capture_mode not in {'args', 'kwargs', 'timestep'}:
-            raise ValueError(f"Invalid capture_mode: {capture_mode}. Must be 'args' or 'kwargs' or 'timestep'")
+            input_layernorm = str(layer) + 'out_anti'
+            out_proj = 'transformer_blocks.' + str(layer) + '.attn.to_out.0'
+            norm_linear[input_layernorm] = [out_proj]
 
-        self._add_hook(self.module)
+            input_layernorm = str(layer) + 'out_context_anti'
+            out_proj_context = 'transformer_blocks.' + str(layer) + '.attn.to_add_out'
+            norm_linear[input_layernorm] = [out_proj_context]
 
-    def save(self, path: str = '__output.pth') -> List[Dict[str, Any]]:
-        """Save captured data and restore original forward method."""
-        data = InputCapture.get_all()
-        torch.save(data, path)
+            input_layernorm = str(layer) + 'ff0_anti'
+            up_proj = 'transformer_blocks.' + str(layer) + '.ff.net.0.proj'
+            norm_linear[input_layernorm] = [up_proj]
 
-        # Restore original forward method
-        if self.old_forward:
-            self.module.forward = self.old_forward
-            self.old_forward = None
+            input_layernorm = str(layer) + 'ff0_context_anti'
+            up_proj_context = 'transformer_blocks.' + str(layer) + '.ff_context.net.0.proj'
+            norm_linear[input_layernorm] = [up_proj_context]
 
-        logger.info('Captured data saved to: %r', path)
-        return data
+        single_layer_num = self.model.config.single_num_layers
+        for layer in range(single_layer_num):
+            input_layernorm = str(layer) + 'qkv_anti'
+            q_proj = 'single_transformer_blocks.' + str(layer) + '.attn.to_q'
+            k_proj = 'single_transformer_blocks.' + str(layer) + '.attn.to_k'
+            v_proj = 'single_transformer_blocks.' + str(layer) + '.attn.to_v'
+            norm_linear[input_layernorm] = [q_proj, k_proj, v_proj]
 
-    def reset(self) -> None:
-        """Reset captured inputs."""
-        InputCapture.reset()
+        return norm_linear
 
-    def _add_hook(self, module: nn.Module) -> Callable:
-        """Add forward hook to the module."""
-        self.old_forward = module.forward
-        wrapper = InputCapture.capture_forward_inputs(
-            self.old_forward,
-            capture_mode=self.capture_mode,
-        )
-        module.forward = wrapper
-        return wrapper
+    def modify_smooth_args(self,
+                           cfg: 'AntiOutlierConfig',
+                           norm_name: str,
+                           linear_names: str,
+                           args: List[Any],
+                           kwargs: Dict[str, Any]):
+        # 针对该模型进行m4量化时，需要对特定层开启偏移
+        if cfg.anti_method == 'm4':
+            kwargs['is_shift'] = False
+            kwargs['alpha'] = cfg.alpha
+        return args, kwargs
 
-
-
-def get_disable_layer_names(model: nn.Module,
-                            layer_include: Union[List[str], Tuple[str], str],
-                            layer_exclude: Union[List[str], Tuple[str], str]) -> List[str]:
-    """
-    Get the names of layers to be disabled based on inclusion and exclusion patterns using fnmatch.
-
-    Args:
-        model: The neural network module
-        layer_include: Patterns for layers to include. Can be a string, list or tuple of strings.
-        layer_exclude: Patterns for layers to exclude. Can be a string, list or tuple of strings.
-
-    Returns:
-        List of layer names that should be disabled for quantization.
-    """
-    # Convert single string patterns to list for uniform processing
-    if isinstance(layer_include, str):
-        layer_include = [layer_include]
-    if isinstance(layer_exclude, str):
-        layer_exclude = [layer_exclude]
-
-    all_layer_names = []
-    quant_layer_names = set()
-    for name, mod in model.named_modules():
-        if isinstance(mod, nn.Linear):
-            all_layer_names.append(name)
-
-        # Check inclusion patterns
-        if layer_include and not any(fnmatch.fnmatch(name, pattern) for pattern in layer_include):
-            continue
-        # Check exclusion patterns
-        if layer_exclude and any(fnmatch.fnmatch(name, pattern) for pattern in layer_exclude):
-            continue
-
-        quant_layer_names.add(name)
-
-    disable_layer_names = [name for name in all_layer_names if name not in quant_layer_names]
-    return disable_layer_names
-
-def to_device(data, device, depth=0):
-    """ recursive function to move data to the specified device """
-    if depth > MAX_RECURSION_DEPTH:
-        raise RecursionError(f"Maximum recursion depth {MAX_RECURSION_DEPTH} exceeded")
-
-    if isinstance(data, dict):
-        return {k: to_device(v, device, depth=depth + 1) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [to_device(item, device, depth=depth + 1) for item in data]
-    elif isinstance(data, tuple):
-        return tuple(to_device(item, device, depth=depth + 1) for item in data)
-    elif isinstance(data, torch.Tensor):
-        return data.to(device)
-    else:
-        return data
 ```
