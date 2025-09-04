@@ -443,9 +443,7 @@ python hpsv2_score.py \
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
 ```python
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -458,393 +456,596 @@ python hpsv2_score.py \
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import argparse
-import csv
-import json
-import time
 
+import inspect
+import functools
+from typing import Any, Callable, Dict, List, Optional, Union
+
+import numpy as np
 import torch
-import torch_npu
+import torch.distributed
+from transformers import (
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPVisionModelWithProjection,
+    T5EncoderModel,
+    T5TokenizerFast,
+)
 
-from torch_npu.contrib import transfer_to_npu
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.loaders import FluxLoraLoaderMixin
+from diffusers.models import AutoencoderKL, FluxTransformer2DModel
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils import (
+    USE_PEFT_BACKEND,
+    is_torch_xla_available,
+    logging,
+    replace_example_docstring,
+    scale_lora_layers,
+    unscale_lora_layers,
+)
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
-from mindiesd import CacheAgent, CacheConfig
-from FLUX1dev import BlockOffloadHook
-from FLUX1dev import FluxPipeline, parallelize_transformer
-from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
-from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
-from transformers import T5EncoderModel
-
-torch_npu.npu.set_compile_mode(jit_compile=False)
+from ..pipeline import FluxPipeline
+from .parallelize_attention import FluxAttnProcessor2_0
+from .freqs_utils import get_rotary_emb_sp
+from .sequence_length_tracker import set_global_seq, set_split_seq
+from .comm import split, gather
 
 
-class PromptLoader:
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+EXAMPLE_DOC_STRING = """
+    Examples:
+        ```py
+        >>> import torch
+        >>> from diffusers import FluxPipeline
+
+        >>> pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        >>> pipe.to("cuda")
+        >>> prompt = "A cat holding a sign that says hello world"
+        >>> # Depending on the variant being used, the pipeline call will slightly vary.
+        >>> # Refer to the pipeline documentation for more details.
+        >>> image = pipe(prompt, num_inference_steps=4, guidance_scale=0.0).images[0]
+        >>> image.save("flux.png")
+        ```
+"""
+
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.16,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    """
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+            must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+            `num_inference_steps` and `sigmas` must be `None`.
+        sigmas (`List[float]`, *optional*):
+            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+            `num_inference_steps` and `timesteps` must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+class FluxPipelineWrapper(FluxPipeline):
+    model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
+    _optional_components = []
+    _callback_tensor_inputs = ["latents", "prompt_embeds"]
+
     def __init__(
-            self,
-            prompt_file: str,
-            prompt_file_type: str,
-            batch_size: int = 1,
-            num_images_per_prompt: int = 1,
-            max_num_prompts: int = 0
+        self,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        text_encoder_2: T5EncoderModel,
+        tokenizer_2: T5TokenizerFast,
+        transformer: FluxTransformer2DModel,
     ):
-        self.check_input_isvalid(batch_size, num_images_per_prompt, max_num_prompts)
-        self.prompts = []
-        self.catagories = ['Not_specified']
-        self.batch_size = batch_size
-        self.num_images_per_prompt = num_images_per_prompt
+        super().__init__(
+            scheduler,
+            vae,
+            text_encoder,
+            tokenizer,
+            text_encoder_2,
+            tokenizer_2,
+            transformer,
+        )
 
-        if prompt_file_type == 'plain':
-            self.load_prompts_plain(prompt_file, max_num_prompts)
-        elif prompt_file_type == 'parti':
-            self.load_prompts_parti(prompt_file, max_num_prompts)
-        elif prompt_file_type == 'hpsv2':
-            self.load_prompts_hpsv2(max_num_prompts)
+    def set_sp_cfg(self, parallel_args):
+        self.ulysses_group = parallel_args["ulysses"]["group"]
+        self.ulysses_world_size = parallel_args["ulysses"]["world_size"]
+        self.ulysses_rank = parallel_args["ulysses"]["rank"]
+
+
+    @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        prompt_2: Optional[Union[str, List[str]]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 28,
+        timesteps: List[int] = None,
+        guidance_scale: float = 7.0,
+        num_images_per_prompt: Optional[int] = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        max_sequence_length: int = 512,
+        use_cache: bool = True,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
+                instead.
+            prompt_2 (`str` or `List[str]`, *optional*):
+                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
+                will be used instead
+            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The height in pixels of the generated image. This is set to 1024 by default for the best results.
+            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The width in pixels of the generated image. This is set to 1024 by default for the best results.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
+                in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
+                passed will be used. Must be in descending order.
+            guidance_scale (`float`, *optional*, defaults to 7.0):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
+                to make generation deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
+                If not provided, pooled text embeddings will be generated from `prompt` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.flux.FluxPipelineOutput`] instead of a plain tuple.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            callback_on_step_end (`Callable`, *optional*):
+                A function that calls at the end of each denoising steps during the inference. The function is called
+                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
+                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
+                `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
+            max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
+
+        Examples:
+
+        Returns:
+            [`~pipelines.flux.FluxPipelineOutput`] or `tuple`: [`~pipelines.flux.FluxPipelineOutput`] if `return_dict`
+            is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
+            images.
+        """
+
+        height = height or self.default_sample_size * self.vae_scale_factor
+        width = width or self.default_sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt,
+            prompt_2,
+            height,
+            width,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = joint_attention_kwargs
+        self._interrupt = False
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
         else:
-            print("This operation is not supported!")
+            batch_size = prompt_embeds.shape[0]
 
-        self.current_id = 0
-        self.inner_id = 0
+        device = self._execution_device
 
-    def __len__(self):
-        return len(self.prompts) * self.num_images_per_prompt
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.current_id == len(self.prompts):
-            raise StopIteration
-        
-        ret = {
-            'prompts': [],
-            'catagories': [],
-            'save_names': [],
-            'n_prompts': self.batch_size,
-        }
-        for _ in range(self.batch_size):
-            if self.current_id == len(self.prompts):
-                ret['prompts'].append('')
-                ret['save_names'].append('')
-                ret['catagories'].append('')
-                ret['n_prompts'] -= 1
-
-            else:
-                prompt, catagory_id = self.prompts[self.current_id]
-                ret['prompts'].append(prompt)
-                ret['catagories'].append(self.catagories[catagory_id])
-                ret['save_names'].append(f'{self.current_id}_{self.inner_id}')
-
-                self.inner_id += 1
-                if self.inner_id == self.num_images_per_prompt:
-                    self.inner_id = 0
-                    self.current_id += 1
-
-        return ret
-    
-    def load_prompts_plain(self, file_path: str, max_num_prompts: int):
-        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
-            for i, line in enumerate(f):
-                if max_num_prompts and i == max_num_prompts:
-                    break
-
-                prompt = line.strip()
-                self.prompts.append((prompt, 0))
-
-    def load_prompts_parti(self, file_path: str, max_num_prompts: int):
-        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
-            # Skip the first line
-            next(f)
-            tsv_file = csv.reader(f, delimiter="\t")
-            for i, line in enumerate(tsv_file):
-                if max_num_prompts and i == max_num_prompts:
-                    break
-
-                prompt = line[0]
-                catagory = line[1]
-                if catagory not in self.catagories:
-                    self.catagories.append(catagory)
-
-                catagory_id = self.catagories.index(catagory)
-                self.prompts.append((prompt, catagory_id))
-
-    def load_prompts_hpsv2(self, max_num_prompts: int):
-        with open('hpsv2_benchmark_prompts.json', 'r') as file:
-            all_prompts = json.load(file)
-        count = 0
-        for style, prompts in all_prompts.items():
-            for prompt in prompts:
-                count += 1
-                if max_num_prompts and count >= max_num_prompts:
-                    break
-
-                if style not in self.catagories:
-                    self.catagories.append(style)
-
-                catagory_id = self.catagories.index(style)
-                self.prompts.append((prompt, catagory_id))
-
-    def check_input_isvalid(self, batch_size, num_images_per_prompt, max_num_prompts):
-        if batch_size <= 0:
-            raise ValueError(f"Param batch_size invalid, expected positive value, but get {batch_size}")
-        if num_images_per_prompt <= 0:
-            raise ValueError(f"Param num_images_per_prompt invalid, expected positive value, but get {num_images_per_prompt}")
-        if max_num_prompts < 0:
-            raise ValueError(f"Param max_num_prompts invalid, expected greater than or equal to 0, \
-                                 but get {max_num_prompts}")
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="./flux", help="Path to the flux model directory")
-    parser.add_argument("--save_path", type=str, default="./res", help="ouput image path")
-    parser.add_argument("--device_id", type=int, default=0, help="NPU device id")
-    parser.add_argument("--device", choices=["npu", "cpu"], default="npu", help="NPU")
-    parser.add_argument("--prompt_path", type=str, default="./prompts.txt", help="input prompt text path")
-    parser.add_argument("--prompt_type", choices=["plain", "parti", "hpsv2"], default="plain", help="specify infer prompt type")
-    parser.add_argument("--num_images_per_prompt", type=int, default=1, help="specify image number every prompt generate")
-    parser.add_argument("--max_num_prompt", type=int, default=0, help="limit the prompt number[0 indicates no limit]")
-    parser.add_argument("--info_file_save_path", type=str, default="./image_info.json", help="path to save image info")
-    parser.add_argument("--width", type=int, default=1024, help='Image size width')
-    parser.add_argument("--height", type=int, default=1024, help='Image size height')  
-    parser.add_argument("--infer_steps", type=int, default=50, help="Inference steps") 
-    parser.add_argument("--seed", type=int, default=42, help="A seed for all the prompts")
-    parser.add_argument("--use_cache", action="store_true", help="turn on dit cache or not")
-    parser.add_argument("--batch_size", type=int, default=1, help="prompt batch size")
-    parser.add_argument("--device_type", choices=["A2-32g", "A2-64g"], default="A2-64g", help="specify device type")
-    # ======================== Parallel config ========================
-    group = parser.add_mutually_exclusive_group()
-
-    group.add_argument(
-        "--tensor_parallel",
-        action="store_true",
-        help="turn on tensor parallel or not."
-    )
-    group.add_argument(
-        "--sequence_parallel",
-        action="store_true",
-        help="turn on sequence parallel or not."
-    )
-    # parser.add_argument(
-    #     "--tensor_parallel",
-    #     action="store_true",
-    #     help="turn on tensor parallel or not.",
-    # )
-    # parser.add_argument(
-    #     "--sequence_parallel",
-    #     action="store_true",
-    #     help="turn on sequence parallel or not.",
-    # )
-    # ======================== Quant config ========================
-    parser.add_argument("--use_quant", action="store_true", help="turn on quant or not")
-    parser.add_argument("--quant_type", choices=["w8a16", "w8a8_dynamic"], default="w8a8_dynamic", help="specify quant type")
-    return parser.parse_args()
-
-
-def initialize_pipeline(args):
-    if args.tensor_parallel or args.sequence_parallel:
-        local_rank = get_local_rank()
-        world_size = get_world_size()
-        if world_size != 2:
-            raise ValueError(f"number of NPUs should be equal to 2.")
-        initialize_torch_distributed(local_rank, world_size)
-        device = torch.device(f"npu:{local_rank}")
-    else:
-        torch.npu.set_device(args.device_id)
-        device = torch.device(f"npu:{args.device_id}")
-
-    check_dir_safety(args.path)
-    T5_model_path = os.path.join(args.path, "text_encoder_2")
-    T5_model = T5EncoderModel.from_pretrained(T5_model_path).to(torch.bfloat16)
-
-    if args.tensor_parallel:
-        from FLUX1dev import replace_tp_from_pretrain, replace_tp_extract_init_dict
-        FluxPipeline.from_pretrained = classmethod(replace_tp_from_pretrain)
-        FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
-
-    pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
-
-    if args.use_cache:
-        d_stream_config = CacheConfig(
-            method="dit_block_cache",
-            blocks_count=19,
-            steps_count=args.infer_steps,
-            step_start=18,
-            step_interval=2,
-            block_start=5,
-            block_end=13,
+        lora_scale = (
+            self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
         )
-        d_stream_agent = CacheAgent(d_stream_config)
-        pipe.transformer.d_stream_agent = d_stream_agent
-        s_stream_config = CacheConfig(
-            method="dit_block_cache",
-            blocks_count=38,
-            steps_count=args.infer_steps,
-            step_start=18,
-            step_interval=2,
-            block_start=1,
-            block_end=23,
+        (
+            prompt_embeds,
+            pooled_prompt_embeds,
+            text_ids,
+        ) = self.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt_2,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            lora_scale=lora_scale,
         )
-        s_stream_agent = CacheAgent(s_stream_config)
-        pipe.transformer.s_stream_agent = s_stream_agent
-    else:
-        d_stream_config = CacheConfig(
-            method="dit_block_cache",
-            blocks_count=19,
-            steps_count=args.infer_steps,
-            step_start=args.infer_steps,
-            step_interval=2,
-            block_start=18,
-            block_end=18,
-        )
-        d_stream_agent = CacheAgent(d_stream_config)
-        pipe.transformer.d_stream_agent = d_stream_agent
-        s_stream_config = CacheConfig(
-            method="dit_block_cache",
-            blocks_count=38,
-            steps_count=args.infer_steps,
-            step_start=args.infer_steps,
-            step_interval=2,
-            block_start=37,
-            block_end=37,
-        )
-        s_stream_agent = CacheAgent(s_stream_config)
-        pipe.transformer.s_stream_agent = s_stream_agent
 
-    
-    if args.tensor_parallel:
-        import deepspeed
-        T5_model = deepspeed.init_inference(
-            T5_model,
-            tensor_parallel={"tp_size": world_size},
+        # 4. Prepare latent variables
+        num_channels_latents = self.transformer.config.in_channels // 4
+        latents, latent_image_ids = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
         )
-        T5_model.module.to("cpu")
-        pipe.to(f"npu:{local_rank}")
-        pipe.text_encoder_2.to("cpu")
-        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
 
-    else:
-        if args.sequence_parallel:
-            parallel_args = {
-                "ulysses":{
-                    "world_size": world_size,
-                    "rank": local_rank,
-                    "group": None
-                }
-            }
-            pipe = parallelize_transformer(pipe, parallel_args)
+        # 5. Prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.base_image_seq_len,
+            self.scheduler.config.max_image_seq_len,
+            self.scheduler.config.base_shift,
+            self.scheduler.config.max_shift,
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            timesteps,
+            sigmas,
+            mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
 
-        if args.device_type == "A2-64g":
-            pipe.to(device)
+        if text_ids.ndim == 3:
+            text_ids = text_ids[0]
+        if latent_image_ids.ndim == 3:
+            latent_image_ids = latent_image_ids[0]
+        ids = torch.cat((text_ids, latent_image_ids), dim=0)
+        image_rotary_emb = self.transformer.pos_embed(ids)
+        image_rotary_emb = [freq.to(torch.bfloat16) for freq in image_rotary_emb]
+
+
+        txt_seq_length = text_ids.shape[0]
+        img_seq_length = latent_image_ids.shape[0]
+        all_seq_length = txt_seq_length + img_seq_length
+        set_global_seq(tensor_name="txt", seq_dim=txt_seq_length)
+        set_global_seq(tensor_name="img", seq_dim=img_seq_length)
+        set_global_seq(tensor_name="all", seq_dim=all_seq_length)
+        set_split_seq(tensor_name="txt", world_size=self.ulysses_world_size)
+        set_split_seq(tensor_name="img", world_size=self.ulysses_world_size)
+        set_split_seq(tensor_name="all", world_size=self.ulysses_world_size)
+
+        image_rotary_emb_sp = get_rotary_emb_sp(image_rotary_emb, text_ids.shape[0], self.ulysses_world_size)
+        latents = split(latents, self.ulysses_world_size, self.ulysses_rank, dim=1)
+        #TODO 不切分txt的话需要注释掉
+        prompt_embeds = split(prompt_embeds, self.ulysses_world_size, self.ulysses_rank, dim=1)
+
+        # 6. Denoising loop
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+                # handle guidance
+                if self.transformer.config.guidance_embeds:
+                    guidance = torch.tensor([guidance_scale], device=device)
+                    guidance = guidance.expand(latents.shape[0])
+                else:
+                    guidance = None
+
+                noise_pred = self.transformer(
+                    hidden_states=latents,
+                    # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb_sp=image_rotary_emb_sp,
+                    txt_ids=text_ids,
+                    img_ids=latent_image_ids,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    use_cache=use_cache,
+                    return_dict=False,
+                    step_idx=i,
+                )[0]
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        latents = gather(latents, self.ulysses_group, self.ulysses_world_size) 
+
+        if output_type == "latent":
+            image = latents
+
         else:
-            if args.use_quant:
-                from mindiesd import quantize
-                quant_config_path = os.path.join(args.path, f"quant_weights_{args.quant_type}/quant_model_description_{args.quant_type}.json")
-                pipe.transformer = quantize(pipe.transformer, quant_config_path, timestep_config=None, dtype=torch.bfloat16)
-                pipe.to(device)
-            else:
-                # pipe.enable_model_cpu_offload()
-                original_transformer = pipe.transformer
-                pipe.transformer = None
-                pipe.to(device)
-                pipe.transformer = original_transformer
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
 
-                transformer_block_hook = BlockOffloadHook(
-                    pipe.transformer.transformer_blocks,
-                    onload_device=device,
-                    block_on_npu_nums=2,
-                    cache_config=d_stream_config
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+
+        return FluxPipelineOutput(images=image)
+
+
+def parallelize_transformer(pipe, parallel_args):
+    pipe = FluxPipelineWrapper(
+        pipe.scheduler,
+        pipe.vae,
+        pipe.text_encoder,
+        pipe.tokenizer,
+        pipe.text_encoder_2,
+        pipe.tokenizer_2,
+        pipe.transformer,
+    )
+    pipe.set_sp_cfg(parallel_args)
+    transformer = pipe.transformer
+
+    @functools.wraps(transformer.__class__.forward)
+    def new_forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        image_rotary_emb: torch.Tensor = None,
+        image_rotary_emb_sp: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        use_cache: bool = True,
+        return_dict: bool = True,
+        step_idx: int = 0,
+    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+        """
+        The [`FluxTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+                from the embeddings of input conditions.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        if joint_attention_kwargs is not None:
+            joint_attention_kwargs = joint_attention_kwargs.copy()
+            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-                transformer_block_hook.register_hook()
-                for name, module in pipe.transformer.named_children():
-                    if name != "transformer_blocks":
-                        module.to(device)
-    return pipe
+        hidden_states = self.x_embedder(hidden_states)
 
-def infer(args):
-    pipe = initialize_pipeline(args)
-
-    torch.manual_seed(args.seed)
-    torch.npu.manual_seed(args.seed)
-    torch.npu.manual_seed_all(args.seed)
-
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path, mode=0o640)
-    check_dir_safety(args.save_path)
-
-    infer_num = 0
-    time_consume = 0
-    current_prompt = None
-    image_info = []
-    check_file_safety(args.prompt_path)
-    prompt_loader = PromptLoader(args.prompt_path,
-                                args.prompt_type,
-                                args.batch_size,
-                                args.num_images_per_prompt,
-                                args.max_num_prompt)
-    check_param_valid(args.height, args.width, args.infer_steps)
-    for _, input_info in enumerate(prompt_loader):
-        prompts = input_info['prompts']
-        catagories = input_info['catagories']
-        save_names = input_info['save_names']
-        n_prompts = input_info['n_prompts']
-
-        check_prompts_valid(prompts)
-
-        print(f"[{infer_num+n_prompts}/{len(prompt_loader)}]: {prompts}")
-        infer_num += args.batch_size
-        if infer_num > 3:
-            torch.npu.synchronize()
-            start_time = time.time()
-
-        image = pipe(
-            prompts,
-            height=args.width,
-            width=args.height,
-            guidance_scale=3.5,
-            num_inference_steps=args.infer_steps,
-            max_sequence_length=512,
-            use_cache=args.use_cache,
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+        else:
+            guidance = None
+        temb = (
+            self.time_text_embed(timestep, pooled_projections)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, pooled_projections)
         )
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        if infer_num > 3:
-            torch.npu.synchronize()
-            end_time = time.time() - start_time
-            time_consume += end_time
+        for _, block in enumerate(self.transformer_blocks):
+            if use_cache:
+                hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
+                    block,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
 
-        for j in range(n_prompts):
-            image_save_path = os.path.join(args.save_path, f"{save_names[j]}.png")
-            image[0][j].save(image_save_path)
+        # #TODO 不切分txt
+        # rank = torch.distributed.get_rank()
+        # world_size = torch.distributed.get_world_size()
+        # encoder_hidden_states = encoder_hidden_states.chunk(world_size, dim=1)[rank]
 
-            if current_prompt != prompts[j]:
-                current_prompt = prompts[j]
-                image_info.append({'images': [], 'prompt': current_prompt, 'category': catagories[j]})
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-            image_info[-1]['images'].append(image_save_path)
-    
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            if os.path.exists(args.info_file_save_path):
-                os.remove(args.info_file_save_path)
+        for _, block in enumerate(self.single_transformer_blocks):
+            if use_cache:
+                hidden_states = self.s_stream_agent.apply(
+                    block,
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )  
 
-            with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
-                json.dump(image_info, f)
-    else:
-        if os.path.exists(args.info_file_save_path):
-            os.remove(args.info_file_save_path)
+        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
 
-        with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
-            json.dump(image_info, f)
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
 
-    image_time_count = len(prompt_loader) - 3
-    print(f"flux pipeline time is:{time_consume/image_time_count}")
+        if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
+            unscale_lora_layers(self, lora_scale)
 
-    return
+        if not return_dict:
+            return (output,)
 
+        return Transformer2DModelOutput(sample=output)
 
-if __name__ == "__main__":
-    inference_args = parse_arguments()
-    infer(inference_args)
+    new_forward = new_forward.__get__(transformer)
+    transformer.forward = new_forward
+
+    transformer.set_attn_processor(FluxAttnProcessor2_0(parallel_args))
+    return pipe
 
 
 ```
