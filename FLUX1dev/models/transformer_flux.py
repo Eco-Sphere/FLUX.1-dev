@@ -484,23 +484,38 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         for _, block in enumerate(self.transformer_blocks):
-            hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
-                block,
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-            )
+            if use_cache:
+                hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
+                    block,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         for _, block in enumerate(self.single_transformer_blocks):
-            hidden_states = self.s_stream_agent.apply(
-                block,
-                hidden_states=hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-            )
+            if use_cache:
+                hidden_states = self.s_stream_agent.apply(
+                    block,
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
 
