@@ -19,11 +19,18 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.distributed
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import (
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPVisionModelWithProjection,
+    T5EncoderModel,
+    T5TokenizerFast,
+)
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FluxLoraLoaderMixin
-from diffusers.models.autoencoders import AutoencoderKL
+from diffusers.models import AutoencoderKL, FluxTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     USE_PEFT_BACKEND,
@@ -145,19 +152,34 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 class FluxPipelineWrapper(FluxPipeline):
-    def __init__(self, pipeline, parallel_args):
-        self.pipeline = pipeline
-        self.parallel_args = parallel_args
-        self.ulysses_group = self.parallel_args["ulysses"]["group"]
-        self.ulysses_world_size = self.parallel_args["ulysses"]["world_size"]
-        self.ulysses_rank = self.parallel_args["ulysses"]["rank"]
+    model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
+    _optional_components = []
+    _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
-    def __getattr__(self, name):
-        return getattr(self.pipeline, name)
+    def __init__(
+        self,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        text_encoder_2: T5EncoderModel,
+        tokenizer_2: T5TokenizerFast,
+        transformer: FluxTransformer2DModel,
+    ):
+        super().__init__(
+            scheduler,
+            vae,
+            text_encoder,
+            tokenizer,
+            text_encoder_2,
+            tokenizer_2,
+            transformer,
+        )
 
-    @property
-    def _execution_device(self):
-        return self.pipeline._execution_device
+    def set_sp_cfg(self, parallel_args):
+        self.ulysses_group = parallel_args["ulysses"]["group"]
+        self.ulysses_world_size = parallel_args["ulysses"]["world_size"]
+        self.ulysses_rank = parallel_args["ulysses"]["rank"]
 
 
     @torch.no_grad()
@@ -438,7 +460,16 @@ class FluxPipelineWrapper(FluxPipeline):
 
 
 def parallelize_transformer(pipe, parallel_args):
-    pipe = FluxPipelineWrapper(pipe, parallel_args)
+    pipe = FluxPipelineWrapper(
+        pipe.scheduler,
+        pipe.vae,
+        pipe.text_encoder,
+        pipe.tokenizer,
+        pipe.text_encoder_2,
+        pipe.tokenizer_2,
+        pipe.transformer,
+    )
+    pipe.set_sp_cfg(parallel_args)
     transformer = pipe.transformer
 
     @functools.wraps(transformer.__class__.forward)
@@ -515,7 +546,7 @@ def parallelize_transformer(pipe, parallel_args):
         for _, block in enumerate(self.transformer_blocks):
             if use_cache:
                 hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
-                    block.forward,
+                    block,
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
@@ -539,17 +570,17 @@ def parallelize_transformer(pipe, parallel_args):
         for _, block in enumerate(self.single_transformer_blocks):
             if use_cache:
                 hidden_states = self.s_stream_agent.apply(
-                    block.forward,
+                    block,
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb_sp,
+                    image_rotary_emb=image_rotary_emb,
                 )
             else:
                 hidden_states = block(
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb_sp,
-                )
+                    image_rotary_emb=image_rotary_emb,
+                )  
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
 
