@@ -422,7 +422,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         timestep: torch.LongTensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
-        image_rotary_emb: torch.Tensor = None,
         guidance: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         use_cache: bool = True,
@@ -483,6 +482,13 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb, image_rotary_emb_single = self.pos_embed(ids)
+
         for _, block in enumerate(self.transformer_blocks):
             if use_cache:
                 hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
@@ -508,13 +514,13 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     block,
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=image_rotary_emb_single,
                 )
             else:
                 hidden_states = block(
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=image_rotary_emb_single,
                 )
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]

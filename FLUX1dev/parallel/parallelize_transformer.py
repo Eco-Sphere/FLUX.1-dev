@@ -47,7 +47,6 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from ..pipeline import FluxPipeline
 from .parallelize_attention import FluxAttnProcessor2_0
-from .freqs_utils import get_rotary_emb_sp
 from .sequence_length_tracker import set_global_seq, set_split_seq
 from .comm import split, gather
 
@@ -357,17 +356,8 @@ class FluxPipelineWrapper(FluxPipeline):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        if text_ids.ndim == 3:
-            text_ids = text_ids[0]
-        if latent_image_ids.ndim == 3:
-            latent_image_ids = latent_image_ids[0]
-        ids = torch.cat((text_ids, latent_image_ids), dim=0)
-        image_rotary_emb = self.transformer.pos_embed(ids)
-        image_rotary_emb = [freq.to(torch.bfloat16) for freq in image_rotary_emb]
-
-
-        txt_seq_length = text_ids.shape[0]
-        img_seq_length = latent_image_ids.shape[0]
+        txt_seq_length = text_ids.shape[-2]
+        img_seq_length = latent_image_ids.shape[-2]
         all_seq_length = txt_seq_length + img_seq_length
         set_global_seq(tensor_name="txt", seq_dim=txt_seq_length)
         set_global_seq(tensor_name="img", seq_dim=img_seq_length)
@@ -376,7 +366,6 @@ class FluxPipelineWrapper(FluxPipeline):
         set_split_seq(tensor_name="img", world_size=self.ulysses_world_size)
         set_split_seq(tensor_name="all", world_size=self.ulysses_world_size)
 
-        image_rotary_emb_sp = get_rotary_emb_sp(image_rotary_emb, text_ids.shape[0], self.ulysses_world_size)
         latents = split(latents, self.ulysses_world_size, self.ulysses_rank, dim=1)
         #TODO 不切分txt的话需要注释掉
         prompt_embeds = split(prompt_embeds, self.ulysses_world_size, self.ulysses_rank, dim=1)
@@ -404,8 +393,6 @@ class FluxPipelineWrapper(FluxPipeline):
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
-                    image_rotary_emb=image_rotary_emb,
-                    image_rotary_emb_sp=image_rotary_emb_sp,
                     txt_ids=text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
@@ -481,8 +468,6 @@ def parallelize_transformer(pipe, parallel_args):
         timestep: torch.LongTensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
-        image_rotary_emb: torch.Tensor = None,
-        image_rotary_emb_sp: torch.Tensor = None,
         guidance: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         use_cache: bool = True,
@@ -543,6 +528,13 @@ def parallelize_transformer(pipe, parallel_args):
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb, image_rotary_emb_single = self.pos_embed(ids)
+
         for _, block in enumerate(self.transformer_blocks):
             if use_cache:
                 hidden_states, encoder_hidden_states = self.d_stream_agent.apply(
@@ -573,13 +565,13 @@ def parallelize_transformer(pipe, parallel_args):
                     block,
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=image_rotary_emb_single,
                 )
             else:
                 hidden_states = block(
                     hidden_states=hidden_states,
                     temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=image_rotary_emb_single,
                 )  
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
