@@ -197,6 +197,9 @@ def initialize_pipeline(args):
         T5_model.module.to("cpu")
 
     pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
+    pipe.transformer.pos_embed.enable_cache(steps_count=args.infer_steps)
+    if args.ulysses_degree > 1:
+        pipe.transformer.pos_embed.enable_seq_parallel()
 
     if args.use_cache:
         d_stream_config = CacheConfig(

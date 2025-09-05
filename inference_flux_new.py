@@ -207,7 +207,10 @@ def initialize_pipeline(args):
         FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
 
     pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
-
+    pipe.transformer.pos_embed.enable_cache(steps_count=args.infer_steps)
+    if args.sequence_parallel:
+        pipe.transformer.pos_embed.enable_seq_parallel()
+        
     if args.use_cache:
         d_stream_config = CacheConfig(
             method="dit_block_cache",
