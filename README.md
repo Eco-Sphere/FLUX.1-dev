@@ -190,7 +190,7 @@ python inference_flux.py \
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
 - use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g-single、A2-32g-dual、A2-64g三个选项
+- device_type: device类型，有A2-32g、A2-64g两个个选项
 - batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 
 ### 4.1 Atlas-800I-A2-64g双卡推理性能测试
@@ -217,9 +217,12 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
        --use_cache \
        --device_type "A2-64g" \
        --batch_size 1 \
-       --ulysses-degree 2
+       --sequence_parallel
 ```
 参数说明：
+- ASCEND_RT_VISIBLE_DEVICES: shell环境变量，用以绑定推理时实际使用的NPU
+- mast_port:master节点端口号，torch_run命令变量设置
+- nproc_per_node:分布式推理使用的NPU数量，设置为2
 - path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
 - save_path: 保存图像路径，默认当前文件夹下的res文件夹
 - device: 推理设备类型，默认为npu
@@ -229,9 +232,9 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
 - use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g-single、A2-32g-dual、A2-64g三个选项
+- device_type: device类型，有A2-32g、A2-64g两个个选项
 - batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
-- ulysses-degree: 指定ulysses并行度
+- sequence_parallel: 指定开启双芯SP并行
 
 ### 4.3 Atlas-800I-A2-32g单卡推理性能测试
 1. 设置权重路径：
@@ -256,11 +259,11 @@ python inference_flux.py \
        --infer_steps 50 \
        --seed 42 \
        --use_cache \
-       --device_type "A2-32g-single"
+       --device_type "A2-32g"
 ```
 参数说明参照Atlas-800I-A2-64g参数说明
 
-### 4.4 Atlas-800I-A2-32g双卡推理性能测试
+### 4.4 Atlas-800I-A2-32g双卡TP并行推理性能测试
 1. 设置权重路径：
 ```bash
 export model_path="your local flux model path"
@@ -294,14 +297,25 @@ python3 tpsplit_weight.py --path ${model_path}
 4. 执行命令：
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py --device_type "A2-32g-dual" --path ${model_path} --prompt_path "./prompts.txt" --width 1024 --height 1024 --infer_steps 50 --seed 42 --use_cache
+ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py \
+       --path ${model_path} \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --use_cache \
+       --tensor_parallel
+
 ```
 参数说明：
-- ASCEND_RT_VISIBLE_DEVICES: shell环境变量，用以绑定推理时实际使用的NPU
-- mast_port:master节点端口号，torch_run命令变量设置
-- nproc_per_node:分布式推理使用的NPU数量，设置为2
+- tensor_parallel:指定开启双芯TP并行
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
+
+### 4.5 Atlas-800I-A2-32g单卡导出量化权重
+
+### 4.6 Atlas-800I-A2-64g单卡导出量化权重
 ### 4.5 精度测试
 #### 4.5.1 ClipScore测试
 1.准备模型与数据集
