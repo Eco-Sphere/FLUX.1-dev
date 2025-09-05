@@ -26,8 +26,26 @@ class FluxPosEmbed(nn.Module):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
+        self.use_cache = False
+        self.seq_parallel = False
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    def enable_cache(self, steps_count):
+        self.use_cache = True
+        self.cache = None
+        self._cur_step = 0
+        self.steps_count = steps_count
+
+    def enable_seq_parallel(self, group=None):
+        import torch.distributed as dist
+        self.seq_parallel = True
+        self.world_size = dist.get_world_size(group=group)
+
+    def _counter(self):
+        self._cur_step += 1  
+        if self._cur_step == self.steps_count:
+            self._cur_step = 0  
+
+    def _forward(self, ids: torch.Tensor) -> torch.Tensor:
         n_axes = ids.shape[-1]
         cos_out = []
         sin_out = []
@@ -45,9 +63,28 @@ class FluxPosEmbed(nn.Module):
             )
             cos_out.append(cos)
             sin_out.append(sin)
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-        return freqs_cos, freqs_sin
+        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device).to(torch.bfloat16)
+        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device).to(torch.bfloat16)
+        if self.seq_parallel:
+            from FLUX1dev.parallel.sequence_length_tracker import get_global_seq
+            from FLUX1dev.parallel.freqs_utils import get_rotary_emb_sp
+            txt_seq_length = get_global_seq(tensor_name="txt")
+            freqs_cos_sp, freqs_sin_sp = get_rotary_emb_sp((freqs_cos, freqs_sin), txt_seq_length, world_size=self.world_size)
+            return (freqs_cos, freqs_sin), (freqs_cos_sp, freqs_sin_sp)
+        else:
+            return (freqs_cos, freqs_sin), (freqs_cos, freqs_sin)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if self.use_cache:
+            if self._cur_step == 0:
+                output = self._forward(ids)
+                self.cache = output
+            else:
+                output = self.cache
+            self._counter()
+            return output
+        else:
+            return self._forward(ids)
 
 
 def get_1d_rotary_pos_embed(
