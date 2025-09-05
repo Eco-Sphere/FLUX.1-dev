@@ -442,3 +442,71 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```python
+class FluxPosEmbed(nn.Module):
+    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
+    def __init__(self, theta: int, axes_dim: List[int]):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        self.use_cache = False
+        self.seq_parallel = False
+
+    def enable_cache(self, steps_count):
+        self.use_cache = True
+        self.cache = None
+        self._cur_step = 0
+        self.steps_count = steps_count
+
+    def enable_seq_parallel(self, group=None):
+        import torch.distributed as dist
+        self.seq_parallel = True
+        self.world_size = dist.get_world_size(group=group)
+
+        
+    def _counter(self):
+        self._cur_step += 1  
+        if self._cur_step == self.steps_count:
+            self._cur_step = 0  
+
+    def _forward(self, ids: torch.Tensor) -> torch.Tensor:
+        n_axes = ids.shape[-1]
+        cos_out = []
+        sin_out = []
+        pos = ids.float()
+        is_mps = ids.device.type == "mps"
+        freqs_dtype = torch.float32 if is_mps else torch.float64
+        for i in range(n_axes):
+            cos, sin = get_1d_rotary_pos_embed(
+                self.axes_dim[i],
+                pos[:, i],
+                theta=self.theta,
+                repeat_interleave_real=True,
+                use_real=True,
+                freqs_dtype=freqs_dtype,
+            )
+            cos_out.append(cos)
+            sin_out.append(sin)
+        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device).to(torch.bfloat16)
+        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device).to(torch.bfloat16)
+        if self.seq_parallel:
+            from FLUX1dev.parallel.sequence_length_tracker import get_global_seq
+            from FLUX1dev.parallel.freqs_utils import get_rotary_emb_sp
+            txt_seq_length = get_global_seq(tensor_name="txt")
+            freqs_cos_sp, freqs_sin_sp = get_rotary_emb_sp((freqs_cos, freqs_sin), txt_seq_length, world_size=self.world_size)
+            return (freqs_cos, freqs_sin), (freqs_cos_sp, freqs_sin_sp)
+        else:
+            return (freqs_cos, freqs_sin), (freqs_cos, freqs_sin)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if self.use_cache:
+            if self._cur_step == 0:
+                output = self._forward(ids)
+                self.cache = output
+            else:
+                output = self.cache
+            self._counter()
+            return output
+        else:
+            return self._forward(ids)
+```
