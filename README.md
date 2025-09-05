@@ -190,7 +190,7 @@ python inference_flux.py \
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
 - use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g、A2-64g两个个选项
+- device_type: device类型，有A2-32g、A2-64g两个选项
 - batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 
 ### 4.1 Atlas-800I-A2-64g双卡推理性能测试
@@ -221,8 +221,8 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
 ```
 参数说明：
 - ASCEND_RT_VISIBLE_DEVICES: shell环境变量，用以绑定推理时实际使用的NPU
-- mast_port:master节点端口号，torch_run命令变量设置
-- nproc_per_node:分布式推理使用的NPU数量，设置为2
+- mast_port: master节点端口号，torch_run命令变量设置
+- nproc_per_node: 分布式推理使用的NPU数量，设置为2
 - path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
 - save_path: 保存图像路径，默认当前文件夹下的res文件夹
 - device: 推理设备类型，默认为npu
@@ -232,7 +232,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
 - use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g、A2-64g两个个选项
+- device_type: device类型，有A2-32g、A2-64g两个选项
 - batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 - sequence_parallel: 指定开启双芯SP并行
 
@@ -309,15 +309,142 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inf
 
 ```
 参数说明：
-- tensor_parallel:指定开启双芯TP并行
+- tensor_parallel: 指定开启双芯TP并行
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
 
-### 4.5 Atlas-800I-A2-32g单卡导出量化权重
+### 4.5 Atlas-800I-A2-32g单卡w8a16量化推理性能测试
+#### 4.5.1 安装量化工具msModelSlim
+参考[官方README](https://gitee.com/ascend/msit/tree/master/msmodelslim)
+1.git clone下载msit仓代码
+2.进入到msit/msmodelslim的目录 cd msit/msmodelslim；并在进入的msmodelslim目录下，运行安装脚本 bash install.sh
+#### 4.5.2 w8a16量化
+执行命令：
+```shell
+# 指定量化类型
+export quant_type="w8a16"
 
-### 4.6 Atlas-800I-A2-64g单卡导出量化权重
-### 4.5 精度测试
-#### 4.5.1 ClipScore测试
+python quant.py \
+       --path ${model_path} \
+       --device_id 7 \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --device_type "A2-32g" \
+       --quant_type ${quant_type}
+```
+参数说明：
+- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+其余参数说明参照Atlas-800I-A2-64g参数说明
+备注：量化成功后，会在模型权重目录生成'quant_weights_w8a16'一个文件夹，文件夹下包含两个文件'quant_model_description_w8a16.json'和'quant_model_weight_w8a16.safetensors'
+
+#### 4.5.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+1. 获取安装包
+- 支持设备：[Atlas 800I A2](https://www.hiascend.com/developer/download/community/result?module=pt+ie+cann&product=4&model=32)
+- [环境准备指导](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha001/softwareinst/instg/instg_0003.html)
+
+2. 安装
+```shell
+# 增加软件包可执行权限，{version}表示软件版本号，{arch}表示CPU架构。
+chmod +x Ascend-cann-nnal_<version>_linux-<arch>.run
+# 默认路径安装:
+./Ascend-cann-nnal_<version>_linux-<arch>.run --install --torch_atb
+# 配置环境变量:
+source ${HOME}/Ascend/nnal/atb/set_env.sh
+```
+
+#### 4.5.4 Atlas-800I-A2-32g单卡w8a16量化推理性能测试
+执行命令：
+```shell
+# 在环境中导入以下环境变量提高推理性能
+export CPU_AFFINITY_CONF=2
+export TASK_QUEUE_ENABLE=2
+# 指定量化类型
+export quant_type="w8a16"
+
+python inference_flux.py \
+       --path ${model_path} \
+       --save_path "./res" \
+       --device_id 0 \
+       --device "npu" \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --use_cache \
+       --device_type "A2-32g" \
+       --use_quant \
+       --quant_type ${quant_type}
+
+```
+参数说明：
+- use_quant: 指定使用量化模型
+- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+其余参数说明参照Atlas-800I-A2-64g参数说明
+
+### 4.6 Atlas-800I-A2-32g单卡w8a8_dynamic量化推理性能测试
+#### 4.6.1 安装量化工具msModelSlim
+参照Atlas-800I-A2-32g单卡w8a16安装量化工具msModelSlim说明
+
+#### 4.6.2 w8a8_dynamic量化
+执行命令：
+```shell
+export quant_type="w8a8_dynamic"
+python quant.py \
+       --path ${model_path} \
+       --device_id 7 \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --device_type "A2-32g" \
+       --use_calib_data \
+       --quant_type ${quant_type}
+```
+参数说明：
+- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+其余参数说明参照Atlas-800I-A2-64g参数说明
+备注：量化成功后，会在模型权重目录生成'quant_weights_w8a8_dynamic'一个文件夹，文件夹下包含两个文件'quant_model_description_w8a8_dynamic.json'和'quant_model_weight_w8a8_dynamic.safetensors'
+
+#### 4.6.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+参照Atlas-800I-A2-32g单卡w8a16安装量化模型推理工具NNAL神经网络加速库和torch_atb说明
+
+#### 4.6.4 Atlas-800I-A2-32g单卡w8a8_dynamic量化推理性能测试
+执行命令：
+```shell
+# 在环境中导入以下环境变量提高推理性能
+export CPU_AFFINITY_CONF=2
+export TASK_QUEUE_ENABLE=2
+# 指定量化类型
+export quant_type="w8a8_dynamic"
+
+python inference_flux.py \
+       --path ${model_path} \
+       --save_path "./res" \
+       --device_id 0 \
+       --device "npu" \
+       --prompt_path "./prompts.txt" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --use_cache \
+       --device_type "A2-32g" \
+       --use_quant \
+       --quant_type ${quant_type}
+
+```
+参数说明：
+- use_quant: 指定使用量化模型
+- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+其余参数说明参照Atlas-800I-A2-64g参数说明
+
+### 4.7 精度测试
+#### 4.7.1 ClipScore测试
 1.准备模型与数据集
 ```shell
 # 下载Parti数据集
@@ -391,7 +518,7 @@ python clipscore.py \
 - model_name: Clip模型名称。
 - model_weights_path: Clip模型权重文件路径。
 
-#### 4.5.2 Hpsv2精度测试
+#### 4.7.2 Hpsv2精度测试
 1.准备模型与数据集
 
 [hpsv2数据集获取](https://gitee.com/ascend/ModelZoo-PyTorch/blob/master/MindIE/MindIE-Torch/built-in/foundation/stable_diffusion_xl/hpsv2_benchmark_prompts.json)
