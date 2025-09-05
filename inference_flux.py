@@ -166,41 +166,51 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42, help="A seed for all the prompts")
     parser.add_argument("--use_cache", action="store_true", help="turn on dit cache or not")
     parser.add_argument("--batch_size", type=int, default=1, help="prompt batch size")
-    parser.add_argument("--device_type", choices=["A2-32g-single", "A2-32g-dual", "A2-64g"], default="A2-64g", help="specify device type")
-    # ======================== SP Parallel args ========================
-    parser.add_argument(
-        "--ulysses-degree",
-        type=int,
-        default=1,
-        help="Ulysses degree.",
+    parser.add_argument("--device_type", choices=["A2-32g", "A2-64g"], default="A2-64g", help="specify device type")
+    # ======================== Parallel config ========================
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--tensor_parallel",
+        action="store_true",
+        help="turn on tensor parallel or not."
     )
+    group.add_argument(
+        "--sequence_parallel",
+        action="store_true",
+        help="turn on sequence parallel or not."
+    )
+    # ======================== Quant config ========================
+    parser.add_argument("--use_quant", action="store_true", help="turn on quant or not")
+    parser.add_argument("--quant_type", choices=["w8a16", "w8a8_dynamic"], default="w8a8_dynamic", help="specify quant type")
     return parser.parse_args()
 
+
 def initialize_pipeline(args):
-    if args.device_type == "A2-32g-dual":
-        from FLUX1dev import replace_tp_from_pretrain, replace_tp_extract_init_dict
-        FluxPipeline.from_pretrained = classmethod(replace_tp_from_pretrain)
-        FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
-    
+    if args.tensor_parallel or args.sequence_parallel:
+        local_rank = get_local_rank()
+        world_size = get_world_size()
+        if world_size != 2:
+            raise ValueError(f"number of NPUs should be equal to 2.")
+        initialize_torch_distributed(local_rank, world_size)
+        device = torch.device(f"npu:{local_rank}")
+    else:
+        torch.npu.set_device(args.device_id)
+        device = torch.device(f"npu:{args.device_id}")
+
     check_dir_safety(args.path)
     T5_model_path = os.path.join(args.path, "text_encoder_2")
     T5_model = T5EncoderModel.from_pretrained(T5_model_path).to(torch.bfloat16)
-    if args.device_type == "A2-32g-dual":
-        local_rank = get_local_rank()
-        world_size = get_world_size()
-        initialize_torch_distributed(local_rank, world_size)
-        import deepspeed
-        T5_model = deepspeed.init_inference(
-            T5_model,
-            tensor_parallel={"tp_size": get_world_size()},
-        )
-        T5_model.module.to("cpu")
+
+    if args.tensor_parallel:
+        from FLUX1dev import replace_tp_from_pretrain, replace_tp_extract_init_dict
+        FluxPipeline.from_pretrained = classmethod(replace_tp_from_pretrain)
+        FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
 
     pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
     pipe.transformer.pos_embed.enable_cache(steps_count=args.infer_steps)
-    if args.ulysses_degree > 1:
+    if args.sequence_parallel:
         pipe.transformer.pos_embed.enable_seq_parallel()
-
+        
     if args.use_cache:
         d_stream_config = CacheConfig(
             method="dit_block_cache",
@@ -248,35 +258,20 @@ def initialize_pipeline(args):
         s_stream_agent = CacheAgent(s_stream_config)
         pipe.transformer.s_stream_agent = s_stream_agent
 
-    if args.device_type == "A2-32g-single":
-        torch.npu.set_device(args.device_id)
-        # pipe.enable_model_cpu_offload()
-        device = f"npu:{args.device_id}"
-        original_transformer = pipe.transformer
-        pipe.transformer = None
-        pipe.to(device)
-        pipe.transformer = original_transformer
-
-        transformer_block_hook = BlockOffloadHook(
-            pipe.transformer.transformer_blocks,
-            onload_device=device,
-            block_on_npu_nums=2,
-            cache_config=d_stream_config
+    
+    if args.tensor_parallel:
+        import deepspeed
+        T5_model = deepspeed.init_inference(
+            T5_model,
+            tensor_parallel={"tp_size": world_size},
         )
-        transformer_block_hook.register_hook()
-        for name, module in pipe.transformer.named_children():
-            if name != "transformer_blocks":
-                module.to(device)
+        T5_model.module.to("cpu")
+        pipe.to(f"npu:{local_rank}")
+        pipe.text_encoder_2.to("cpu")
+        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
 
-    elif args.device_type == "A2-64g":
-        if args.ulysses_degree > 1:
-            local_rank = get_local_rank()
-            world_size = get_world_size()
-            initialize_torch_distributed(local_rank, world_size)
-            if world_size != args.ulysses_degree:
-                raise ValueError(f"number of NPUs should be equal to ulysses_degree.")
-            device = torch.device(f"npu:{local_rank}")
-            pipe.to(device)
+    else:
+        if args.sequence_parallel:
             parallel_args = {
                 "ulysses":{
                     "world_size": world_size,
@@ -285,22 +280,40 @@ def initialize_pipeline(args):
                 }
             }
             pipe = parallelize_transformer(pipe, parallel_args)
-        else:
-            torch.npu.set_device(args.device_id)
-            pipe.to(f"npu:{args.device_id}")
-    else:
-        pipe.to(f"npu:{local_rank}")
-        pipe.text_encoder_2.to("cpu")
-        pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
 
+        if args.device_type == "A2-64g":
+            pipe.to(device)
+        else:
+            if args.use_quant:
+                from mindiesd import quantize
+                quant_config_path = os.path.join(args.path, f"quant_weights_{args.quant_type}/quant_model_description_{args.quant_type}.json")
+                pipe.transformer = quantize(pipe.transformer, quant_config_path, timestep_config=None, dtype=torch.bfloat16)
+                pipe.to(device)
+            else:
+                # pipe.enable_model_cpu_offload()
+                original_transformer = pipe.transformer
+                pipe.transformer = None
+                pipe.to(device)
+                pipe.transformer = original_transformer
+
+                transformer_block_hook = BlockOffloadHook(
+                    pipe.transformer.transformer_blocks,
+                    onload_device=device,
+                    block_on_npu_nums=2,
+                    cache_config=d_stream_config
+                )
+                transformer_block_hook.register_hook()
+                for name, module in pipe.transformer.named_children():
+                    if name != "transformer_blocks":
+                        module.to(device)
     return pipe
 
 def infer(args):
-    pipe = initialize_pipeline(args)
-
     torch.manual_seed(args.seed)
     torch.npu.manual_seed(args.seed)
     torch.npu.manual_seed_all(args.seed)
+
+    pipe = initialize_pipeline(args)
 
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path, mode=0o640)
@@ -319,7 +332,6 @@ def infer(args):
     check_param_valid(args.height, args.width, args.infer_steps)
     for _, input_info in enumerate(prompt_loader):
         prompts = input_info['prompts']
-        save_names = input_info['save_names']
         catagories = input_info['catagories']
         save_names = input_info['save_names']
         n_prompts = input_info['n_prompts']
