@@ -296,16 +296,25 @@ def initialize_pipeline(args):
                 pipe.to(device)
                 pipe.transformer = original_transformer
 
-                transformer_block_hook = BlockOffloadHook(
+                transformer_block_hook = BlockOffloadHookV2(
                     pipe.transformer.transformer_blocks,
                     onload_device=device,
                     block_on_npu_nums=2,
                     cache_config=d_stream_config
                 )
                 transformer_block_hook.register_hook()
+
+                single_transformer_block_hook = BlockOffloadHookV2(
+                    pipe.transformer.single_transformer_blocks,
+                    onload_device=device,
+                    block_on_npu_nums=2,
+                    cache_config=s_stream_config
+                )
+                single_transformer_block_hook.register_hook()
+
                 for name, module in pipe.transformer.named_children():
-                    if name != "transformer_blocks":
-                        module.to(device)
+                    if name not in ["transformer_blocks", "single_transformer_blocks"]:
+                        module.to(device) 
     return pipe
 
 def infer(args):
