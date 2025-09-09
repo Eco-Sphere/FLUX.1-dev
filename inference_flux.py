@@ -25,7 +25,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
 from mindiesd import CacheAgent, CacheConfig
-from FLUX1dev import BlockOffloadHook
+from FLUX1dev import BlockOffloadHookV2
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
