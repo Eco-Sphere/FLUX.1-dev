@@ -583,3 +583,140 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```python
+class BlockOffloadHookV2():
+    r"""
+    Block Level Offload: 偶数block常驻NPU, 其余block offload, 用两个block的计算掩盖一个block的offload
+    """
+
+    def __init__(
+        self, 
+        model,
+        onload_device: str = "npu",
+        block_on_npu_nums: int = 2,
+        cache_config: CacheConfig = None
+    ) -> None:
+        self.model = model
+        self.onload_device = onload_device
+        self.block_nums = len(self.model)
+        self.events = []
+        for _ in range(self.block_nums):
+            self.events.append(torch.npu.Event())
+        self.h2d_stream = torch.npu.Stream()
+        self.d2h_stream = torch.npu.Stream()
+        self.block_on_npu_nums = block_on_npu_nums
+        self.cache_config = cache_config
+        self.use_cache = False
+
+        if self.cache_config is not None:
+            assert self.cache_config.method == "dit_block_cache"
+            assert self.cache_config.blocks_count == self.block_nums
+            self.use_cache = self.check_cache_config()
+            if self.use_cache:
+                self.set_cache_states()
+
+    def set_cache_states(self):
+        self._cur_step = -1
+        self.steps_count = self.cache_config.steps_count
+        self.block_start = self.cache_config.block_start
+        self.block_end = self.cache_config.block_end
+        self.skip_blocks = self.block_end - self.block_start
+    
+        self.block_on_npu_nums = min(self.block_on_npu_nums, self.block_start)
+
+        self.skip_steps = []
+        for cur_step in range(0, self.steps_count):
+            if cur_step >= self.cache_config.step_start:
+                diftime = cur_step - self.cache_config.step_start
+                if diftime % self.cache_config.step_interval != 0:
+                    self.skip_steps.append(cur_step)
+                
+    def check_cache_config(self):
+        if self.cache_config.step_start >= self.cache_config.steps_count or \
+            self.cache_config.step_end == self.cache_config.step_start:
+            return False
+
+        if self.cache_config.block_start >= self.cache_config.blocks_count or \
+            self.cache_config.block_end == self.cache_config.block_start:
+            return False
+        
+        if self.cache_config.step_interval == 1:
+            return False
+
+        return True
+
+    def get_next_blk_idx(self, cur_blk_idx):
+        if self.use_cache and self._cur_step in self.skip_steps:
+            if cur_blk_idx == 0:
+                next_blk_idx = cur_blk_idx + 1
+            elif cur_blk_idx % 2 != 0:
+                next_blk_idx = cur_blk_idx + 2
+            if next_blk_idx >= self.block_start and cur_blk_idx < self.block_end:
+                next_blk_idx = self.block_end
+                if self.block_end % 2 == 0:
+                    next_blk_idx += 1
+        else:
+            if cur_blk_idx == 0:
+                next_blk_idx = cur_blk_idx + 1
+            elif cur_blk_idx % 2 != 0:
+                next_blk_idx = cur_blk_idx + 2
+
+        return next_blk_idx
+
+    def onload_block_to_device(self, block: torch.nn.Module, input):
+        cur_blk_idx = block.index
+        next_blk_idx = self.get_next_blk_idx(cur_blk_idx)
+        forward_event = torch.npu.Event()
+        forward_event.record()
+
+        if next_blk_idx < self.block_nums:
+            with torch.npu.stream(self.h2d_stream):
+                self.h2d_stream.wait_event(forward_event)
+                onload_parameters_to_device(self.model[next_blk_idx])
+                onload_buffers_to_device(self.model[next_blk_idx])
+                self.events[next_blk_idx].record()
+
+        torch.npu.current_stream().wait_event(self.events[cur_blk_idx])
+
+    def offload_block_to_memory(self, block: torch.nn.Module, input, output):
+        forward_event = torch.npu.Event()
+        forward_event.record()
+        with torch.npu.stream(self.d2h_stream):
+            self.d2h_stream.wait_event(forward_event)  
+            offload_parameters_to_memory(block)
+            offload_buffers_to_memory(block)
+        torch.npu.current_stream().wait_stream(self.d2h_stream)
+
+    def count_step(self, block: torch.nn.Module, input):
+        self._cur_step += 1  
+        if self._cur_step == self.steps_count:
+            self._cur_step = -1  
+
+    def register_hook(self):
+        for idx, block in enumerate(self.model):
+            block.index = idx
+
+        with torch.npu.stream(self.h2d_stream):
+            for blk_idx in range(self.block_nums):
+                self.model[blk_idx].to(self.onload_device)
+                
+                if blk_idx % 2 != 0:
+                    # blk_idx为奇数的都需要offload, 为偶数的常驻npu
+                    initialize_parameters_on_memory(self.model[blk_idx])
+                    initialize_buffers_on_memory(self.model[blk_idx])
+
+        torch.npu.current_stream().wait_stream(self.h2d_stream)
+
+        for blk_idx in range(self.block_nums):
+            if blk_idx == 0:
+                self.model[blk_idx].register_forward_pre_hook(self.onload_block_to_device)  
+            elif blk_idx % 2 != 0:
+                self.model[blk_idx].register_forward_pre_hook(self.onload_block_to_device) 
+
+            if blk_idx % 2 != 0:
+                self.model[blk_idx].register_forward_hook(self.offload_block_to_memory)  
+
+        if self.use_cache:
+            # self.model[self.block_nums-1].register_forward_hook(self.count_step)  
+            self.model[0].register_forward_pre_hook(self.count_step)  
+```
