@@ -22,6 +22,9 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 def clip_score(model_clip, tokenizer, preprocess, prompt, image_files, device):
@@ -46,11 +49,8 @@ def clip_score(model_clip, tokenizer, preprocess, prompt, image_files, device):
 
 def main():
     args = parse_arguments()
-    
-    if args.device is None:
-        device = torch.device('cuda' if (torch.cuda.is_available()) else 'cpu')
-    else:
-        device = torch.device(args.device)
+    device = torch.device(args.device)
+    torch.npu.set_device(args.device_id)
     
     t_b = time.time()
     print(f"Load clip model...") 
@@ -111,9 +111,15 @@ def parse_arguments():
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
-        choices=["cpu", "cuda"],
+        default="npu",
+        choices=["cpu", "cuda", "npu"],
         help="device for torch.",
+    )
+    parser.add_argument(
+        "--device_id",
+        type=int,
+        default=0,
+        help="device id for torch.",
     )
     parser.add_argument(
         "--image_info",
