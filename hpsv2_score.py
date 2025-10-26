@@ -25,7 +25,8 @@ import huggingface_hub
 from PIL import Image
 import requests
 import torch
-
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 
 def initialize_model(pretrained_path, device):
     model, _, preprocess_val = create_model_and_transforms(
@@ -68,13 +69,20 @@ def parse_arguments():
         default="./CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin",
         help="open clip model weights",
     )
+    parser.add_argument(
+        "--device_id",
+        type=int,
+        default=0,
+        help="device id for torch.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f"npu:{args.device_id}")
+    torch.npu.set_device(device)
 
     model, preprocess_val = initialize_model(args.clip_checkpoint, device)
 
