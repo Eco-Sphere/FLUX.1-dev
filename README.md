@@ -583,15 +583,3 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
-USER_ABI_VERSION_RAW=$(python3 -c "import torch; print(1 if torch.compiled_with_cxx11_abi() else 0)" 2>/dev/null)
-
-# 检查命令是否执行成功（如 PyTorch 未安装、属性不存在等）
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to retrieve PyTorch ABI version!"
-    echo "Possible reasons: PyTorch is not installed, or the version is too old (missing the _GLIBCXX_USE_CXX11_ABI attribute)."
-    exit 1
-fi
-
-# 去除空白字符，确保结果纯净
-export USER_ABI_VERSION=$(echo "$USER_ABI_VERSION_RAW" | tr -d '[:space:]')
-echo "Successfully retrieved PyTorch CXX11 ABI version: $USER_ABI_VERSION"
