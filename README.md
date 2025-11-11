@@ -584,245 +584,67 @@ python hpsv2_score.py \
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
 ```shell
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2024 Huawei Technologies Co., Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0 
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import os
-from pathlib import Path
-from typing import Dict, Optional, Tuple
-
+import unittest
+import sys
 import torch
 import torch.nn as nn
-import torch_npu
-from ..utils import ParametersInvalid, file_utils
 
-current_path = Path(__file__).resolve()
-if len(current_path.parents) < 2:
-    raise ParametersInvalid("The parents level is insufficient.")
-ops_path = current_path.parents[1] / "plugin"
-ops_path = file_utils.standardize_path(str(ops_path))
-ops_file = os.path.join(ops_path, "libPTAExtensionOPS.so")
-file_utils.check_file_safety(ops_file, permission_mode=file_utils.MODELDATA_FILE_PERMISSION)
-torch.ops.load_library(ops_file)
+sys.path.append('../')
+from mindiesd.layers.norm import AdaLayerNorm, AdaLayerNormZero, AdaLayerNormZeroSingle, AdaLayerNormContinuous
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+class TestAdaLayerNorm(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(42)
 
-    def forward(self, hidden_states, if_fused=True):
-        if hidden_states.dim() < 2 or hidden_states.dim() > 8:
-            raise ParametersInvalid("The input dimension should be greater than 1 and less than 9.")
-        if if_fused:
-            return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
-        else:
-            input_dtype = hidden_states.dtype
-            hidden_states = hidden_states.to(torch.float32)
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-            return self.weight * hidden_states.to(input_dtype)
-
-
-def ada_layernorm(layernorm: nn.LayerNorm, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
-    if layernorm.elementwise_affine:
-        weight = layernorm.weight
-        bias = layernorm.bias
-        out = torch.ops.mindie.adaln_mindie_sd(x=x, scale=scale, shift=shift, \
-            weight_opt=weight, bias_opt=bias, epsilon_opt=layernorm.eps)
-    else:
-        out = torch.ops.mindie.adaln_mindie_sd(x=x, scale=scale, shift=shift, epsilon=layernorm.eps)
+        self.batch_size = 1
+        self.sequence_length = 4096
+        self.hidden_dim = 64
         
-    return out
+        self.hidden_states = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to("npu").to(torch.float32)
+        self.emb = torch.randn(self.batch_size, self.hidden_dim).to("npu").to(torch.float32)
+        self.temb = torch.randn(self.batch_size, self.hidden_dim).to("npu").to(torch.float32)
 
+        self.adaln = AdaLayerNorm(embedding_dim=self.hidden_dim, chunk_dim=1).to("npu").to(torch.float32)
+        self.adaln_zero = AdaLayerNormZero(embedding_dim=self.hidden_dim).to("npu").to(torch.float32)
+        self.adaln_zero_single = AdaLayerNormZeroSingle(embedding_dim=self.hidden_dim).to("npu").to(torch.float32)
+        self.adaln_continuous = AdaLayerNormContinuous(self.hidden_dim, self.hidden_dim, elementwise_affine=False).to("npu").to(torch.float32)
 
-class AdaLayerNorm(nn.Module):
-    r"""
-    Norm layer modified to incorporate timestep embeddings.
+    @torch.no_grad()
+    def test_fused_vs_non_fused_adaln(self):
+        output_non_fused = self.adaln(self.hidden_states, temb=self.temb, if_fused=False)
+        output_fused = self.adaln(self.hidden_states, temb=self.temb, if_fused=True)
+        self.assertTrue(
+            torch.allclose(output_non_fused, output_fused.to(output_non_fused.dtype), atol=1e-6),
+            "Fused and Non-Fused AdaLayerNorm outputs do not match!"
+        )
 
-    Parameters:
-        embedding_dim (`int`): The size of each embedding vector.
-        num_embeddings (`int`, *optional*): The size of the embeddings dictionary.
-        output_dim (`int`, *optional*):
-        norm_elementwise_affine (`bool`, defaults to `False):
-        norm_eps (`bool`, defaults to `False`):
-        chunk_dim (`int`, defaults to `0`):
-    """
+    @torch.no_grad()
+    def test_fused_vs_non_fused_adaln_zero(self):
+        output_non_fused = self.adaln_zero(self.hidden_states, emb=self.emb, if_fused=False)[0]
+        output_fused = self.adaln_zero(self.hidden_states, emb=self.emb, if_fused=True)[0]
+        self.assertTrue(
+            torch.allclose(output_non_fused, output_fused.to(output_non_fused.dtype), atol=1e-6),
+            "Fused and Non-Fused AdaLayerNormZero outputs do not match!"
+        )
 
-    def __init__(
-        self,
-        embedding_dim: int,
-        num_embeddings: Optional[int] = None,
-        output_dim: Optional[int] = None,
-        norm_elementwise_affine: bool = False,
-        norm_eps: float = 1e-5,
-        chunk_dim: int = 0,
-    ):
-        super().__init__()
+    @torch.no_grad()
+    def test_fused_vs_non_fused_adaln_zero_single(self):
+        output_non_fused = self.adaln_zero_single(self.hidden_states, emb=self.emb, if_fused=False)[0]
+        output_fused = self.adaln_zero_single(self.hidden_states, emb=self.emb, if_fused=True)[0]
+        self.assertTrue(
+            torch.allclose(output_non_fused, output_fused.to(output_non_fused.dtype), atol=1e-6),
+            "Fused and Non-Fused AdaLayerNormZeroSingle outputs do not match!"
+        )
 
-        self.chunk_dim = chunk_dim
-        output_dim = output_dim or embedding_dim * 2
+    @torch.no_grad()
+    def test_fused_vs_non_fused_adaln_continuous(self):
+        output_non_fused = self.adaln_continuous(self.hidden_states, self.temb, if_fused=False)
+        output_fused = self.adaln_continuous(self.hidden_states, self.temb, if_fused=True)
+        self.assertTrue(
+            torch.allclose(output_non_fused, output_fused.to(output_non_fused.dtype), atol=1e-6),
+            "Fused and Non-Fused AdaLayerNormContinuous outputs do not match!"
+        )
 
-        if num_embeddings is not None:
-            self.emb = nn.Embedding(num_embeddings, embedding_dim)
-        else:
-            self.emb = None
-
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, output_dim)
-        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)
-
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        timestep: Optional[torch.Tensor] = None, 
-        temb: Optional[torch.Tensor] = None,
-        if_fused=True
-    ) -> torch.Tensor:
-        if self.emb is not None:
-            temb = self.emb(timestep)
-
-        temb = self.linear(self.silu(temb))
-
-        if self.chunk_dim == 1:
-            # This is a bit weird why we have the order of "shift, scale" here and "scale, shift" in the
-            # other if-branch. This branch is specific to CogVideoX for now.
-            shift, scale = temb.chunk(2, dim=1)
-            shift = shift[:, None, :]
-            scale = scale[:, None, :]
-        else:
-            scale, shift = temb.chunk(2, dim=0)
-
-        if if_fused:
-            x = ada_layernorm(layernorm=self.norm, x=x, scale=scale, shift=shift)
-        else:
-            x = self.norm(x) * (1 + scale) + shift
-        return x
-
-class AdaLayerNormZero(nn.Module):
-    r"""
-    Norm layer adaptive layer norm zero (adaLN-Zero).
-
-    Parameters:
-        embedding_dim (`int`): The size of each embedding vector.
-        num_embeddings (`int`): The size of the embeddings dictionary.
-    """
-
-    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True):
-        super().__init__()
-        if num_embeddings is not None:
-            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
-        else:
-            self.emb = None
-
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=bias)
-        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        timestep: Optional[torch.Tensor] = None,
-        class_labels: Optional[torch.LongTensor] = None,
-        hidden_dtype: Optional[torch.dtype] = None,
-        emb: Optional[torch.Tensor] = None,
-        if_fused=True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.emb is not None:
-            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
-        
-        if if_fused:
-            x = ada_layernorm(layernorm=self.norm, x=x, scale=scale_msa, shift=shift_msa)
-        else:
-            x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
-
-
-class AdaLayerNormZeroSingle(nn.Module):
-    r"""
-    Norm layer adaptive layer norm zero (adaLN-Zero).
-
-    Parameters:
-        embedding_dim (`int`): The size of each embedding vector.
-        num_embeddings (`int`): The size of the embeddings dictionary.
-    """
-
-    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
-        super().__init__()
-
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
-        if norm_type == "layer_norm":
-            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
-        else:
-            raise ValueError(
-                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
-            )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        emb: Optional[torch.Tensor] = None,
-        if_fused=True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
-        if if_fused:
-            x = ada_layernorm(layernorm=self.norm, x=x, scale=scale_msa, shift=shift_msa)
-        else:
-            x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        return x, gate_msa
-
-class AdaLayerNormContinuous(nn.Module):
-    def __init__(
-        self,
-        embedding_dim: int,
-        conditioning_embedding_dim: int,
-        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
-        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
-        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
-        # However, this is how it was implemented in the original code, and it's rather likely you should
-        # set `elementwise_affine` to False.
-        elementwise_affine=True,
-        eps=1e-5,
-        bias=True,
-        norm_type="layer_norm"
-    ):
-        super().__init__()
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
-        self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
-
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        conditioning_embedding: torch.Tensor,
-        if_fused=True
-        ) -> torch.Tensor:
-        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
-        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
-        scale, shift = torch.chunk(emb, 2, dim=1)
-        if if_fused:
-            x = ada_layernorm(layernorm=self.norm, x=x, scale=scale, shift=shift)
-        else:
-            x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
-        return x
+if __name__ == "__main__":
+    unittest.main()
 ```
