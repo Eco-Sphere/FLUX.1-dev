@@ -583,3 +583,109 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```shell
+#include <torch/library.h>
+
+#include "torch_npu/csrc/framework/utils/OpAdapter.h"
+#include "torch_npu/csrc/core/npu/NPUFormat.h"
+#include "pytorch_npu_helper.hpp"
+#include "adaln.h"
+
+using namespace at;
+
+at::Tensor adaln_mindie_sd_impl_npu(
+    const at::Tensor &x, 
+    const at::Tensor &scale,
+    const at::Tensor &shift,
+    const c10::optional<at::Tensor> &weight_opt,
+    const c10::optional<at::Tensor> &bias_opt,
+    const c10::optional<double> &epsilon_opt)
+{
+    size_t x_dim = x.sizes().size();
+
+    if (x_dim != 3) {
+        throw std::invalid_argument("The first input dimension of AdaLayerNorm must be 3 but got " + str(x_dim));
+    }
+    size_t scale_dim = scale.sizes().size();
+    if (!(scale_dim == 2 || scale_dim == 3)) {
+        throw std::invalid_argument("The second input dimension of AdaLayerNorm must be 2 or 3 but got " + str(scale_dim));
+    }
+    size_t shift_dim = shift.sizes().size();
+    if (!(shift_dim == 2 || shift_dim == 3)) {
+        throw std::invalid_argument("The third input dimension of AdaLayerNorm must be 2 or 3 but got " + str(shift_dim));
+    }
+
+    double epsilon = epsilon_opt.value_or(1e-5);
+    const at::Tensor& weight = c10::value_or_else(weight_opt, [] {return at::Tensor();});
+    const at::Tensor& bias = c10::value_or_else(bias_opt, [] {return at::Tensor();});
+
+    at::Tensor output = at_npu::native::empty_with_format(
+        x.sizes(),
+        x.options(), 
+        at_npu::native::get_npu_format(x)
+    );
+    EXEC_NPU_CMD(aclnnAdaLayerNorm, x, scale, shift, weight, bias, epsilon, output);
+    return output;
+}
+ #ifndef ADALN_MINDIE_SD_IMPL_H
+ #define ADALN_MINDIE_SD_IMPL_H
+ 
+ #include <ATen/Tensor.h>
+ #include <c10/util/Optional.h>
+ 
+ at::Tensor adaln_mindie_sd_impl_npu(
+     const at::Tensor &x, 
+     const at::Tensor &scale,
+     const at::Tensor &shift,
+     const c10::optional<at::Tensor> &weight_opt,
+     const c10::optional<at::Tensor> &bias_opt,
+     const c10::optional<double> &epsilon_opt);
+ #endif // ADALN_MINDIE_SD_IMPL_H
+    m.def("adaln_mindie_sd(Tensor x, Tensor scale, Tensor shift, Tensor? weight=None, \
+        Tensor? bias=None, float? epsilon=1e-5) \
+        -> Tensor");
+m.impl("adaln_mindie_sd", &adaln_mindie_sd_impl_npu);
+execute_process(
+  COMMAND which python3
+  OUTPUT_VARIABLE Python3_EXECUTABLE
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
+  OUTPUT_VARIABLE Python3_INCLUDE_DIRS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"
+  OUTPUT_VARIABLE Python3_LIBRARY_DIRS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))"
+  OUTPUT_VARIABLE Python3_LIBRARY_NAME
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+set(Python3_LIBRARIES ${Python3_LIBRARY_DIRS}/${Python3_LIBRARY_NAME})
+
+# 4. 验证Python版本是否为3.11（不满足则报错）
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import sys; print('.'.join(map(str, sys.version_info[:2])))",
+  OUTPUT_VARIABLE Python3_VERSION
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT Python3_VERSION STREQUAL "3.11")
+  message(FATAL_ERROR "当前Python版本为${Python3_VERSION}，需使用Python 3.11！请激活正确的环境后重试。")
+endif()
+
+# 打印Python相关路径（方便调试确认）
+message(STATUS "当前Python可执行文件：${Python3_EXECUTABLE}")
+message(STATUS "Python头文件路径：${Python3_INCLUDE_DIRS}")
+message(STATUS "Python库路径：${Python3_LIBRARY_DIRS}")
+message(STATUS "Python库文件：${Python3_LIBRARIES}")
+
+include_directories(${Python3_INCLUDE_DIRS})  # 自动添加Python头文件路径
+link_directories(${Python3_LIBRARY_DIRS})    # 自动链接Python库路径
+
+target_link_libraries(PTAExtensionOPS PUBLIC c10 torch torch_cpu torch_npu ascendcl ${Python3_LIBRARIES})
+
+```
