@@ -583,3 +583,184 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```shell
+set -e
+BUILD_DIR=$(dirname $(readlink -f $0))
+PROJ_ROOT_DIR=${BUILD_DIR}/..
+export OUTPUT_DIR=$PROJ_ROOT_DIR/output
+
+if [ ! -d "$OUTPUT_DIR" ];then
+    mkdir -p $OUTPUT_DIR
+fi
+
+AFT_PATH=${PROJ_ROOT_DIR}
+chmod a-w $BUILD_DIR/*
+
+rm -rf ${PROJ_ROOT_DIR}/dist/*
+cd ${PROJ_ROOT_DIR}
+MindIESDVersion="1.0.RC1"
+if [ ! -f "${PROJ_ROOT_DIR}"/../CI/config/version.ini ]; then
+    echo "version.ini is not exsited !"
+else
+    MindIESDVersion=$(cat ${PROJ_ROOT_DIR}/../CI/config/version.ini | grep "PackageName" | cut -d "=" -f 2)
+fi
+MindIESDVersion=$(echo $MindIESDVersion | sed -E 's/([0-9]+)\.([0-9]+)\.RC([0-9]+)\.([0-9]+)/\1.\2rc\3.post\4/')
+MindIESDWheelVersion=$(echo $MindIESDVersion | sed -s 's!.T!.alpha!')
+MindIESDVersion=$(echo $MindIESDVersion | sed -s 's!.T!+t!')
+echo "MindIESDVersion $MindIESDVersion"
+echo "MindIESDWheelVersion $MindIESDWheelVersion"
+
+# "aarch64" / "x86_64"
+ARCH=$(uname -m)
+if [[ "${ARCH}" != "aarch64" && "${ARCH}" != "x86_64" ]]; then
+    echo "It is not system of aarch64 or x86_64"
+    exit 1
+fi
+
+PYTHON_VERSION=""
+if command -v python3 &> /dev/null; then
+    version=$(python3 --version | awk '{print$2}')
+    major=$(echo $version | cut -d '.' -f 1)
+    minor=$(echo $version | cut -d '.' -f 2)
+    PYTHON_VERSION="py${major}${minor}"
+    echo "python version is: $PYTHON_VERSION"
+else
+    echo "cannot get python version"
+    exit 1
+fi
+
+rm -rf $OUTPUT_DIR/*
+mkdir -p $OUTPUT_DIR/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+# cp ${PROJ_ROOT_DIR}/dist/mindie*.whl ${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+cp ${PROJ_ROOT_DIR}/requirements.txt ${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+
+if [ -n "$AFT_PATH" ] && [ -d "$AFT_PATH" ]; then
+    export RELEASE_TMP_DIR=${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+    source ${AFT_PATH}/build/build_ops.sh ${AFT_PATH}/build
+    SET_ENV_PATH=${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}/set_env.sh
+    touch ${SET_ENV_PATH}
+    echo "path=\${BASH_SOURCE[0]}" >> ${SET_ENV_PATH}
+    echo "SD_OPS_HOME=\$(cd \$(dirname \$path); pwd )" >> ${SET_ENV_PATH}
+    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/customize:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
+    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/aie_ascendc:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
+elif [ -n "$AFT_PATH" ]; then
+    echo "Waring: The path of ascend-faster-transformer $AFT_PATH does not exist."
+fi
+
+cd ${PROJ_ROOT_DIR}
+python3 ${PROJ_ROOT_DIR}/setup.py --setup_cmd='bdist_wheel' --version=${MindIESDWheelVersion}
+
+cd $OUTPUT_DIR
+tar_package_name="Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}.tar.gz"
+tar czf $tar_package_name ./Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH} --owner=0 --group=0
+rm -rf ./Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+
+import logging
+import os
+import sys
+import shutil
+import argparse
+import subprocess
+from setuptools import setup, find_packages, Extension
+
+os.environ["SOURCE_DATE_EPOCH"] = "0"
+
+
+def copy_so_files(src_dir, dest_dir):
+    # 确保目标目录存在
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    # 构建cp命令
+    so_files = [f for f in os.listdir(src_dir) if f.endswith('.so')]
+    if not so_files:
+        logging.warning(f"No .so files found in {src_dir}")
+        return
+
+    for so_file in so_files:
+        src_file = os.path.join(src_dir, so_file)
+        dest_file = os.path.join(dest_dir, so_file)
+        # 使用subprocess调用cp命令
+        subprocess.check_call(['/bin/cp', '-v', src_file, dest_file])  # -v选项用于显示详细信息
+        logging.info(f"Copied {src_file} to {dest_file}")
+
+def copy_vendors_to_ops(src_dir, dest_dir):
+    if os.path.exists(dest_dir):
+        logging.info(f"Target directory {dest_dir} exists, deleting...")
+        shutil.rmtree(dest_dir)  
+
+    os.makedirs(dest_dir)
+    logging.info(f"Created new target directory: {dest_dir}")
+
+    if not os.path.exists(src_dir):
+        logging.warning(f"Source vendors directory not found: {src_dir}")
+        return
+
+    cmd = f'/bin/cp -r -v "{src_dir}"/* "{dest_dir}"'
+    try:
+        subprocess.check_call(cmd, shell=True)
+        logging.info(f"Successfully copied all content from {src_dir} to {dest_dir}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to copy vendors directory: {e}")
+        raise  
+
+def get_requirements(req_path):
+    if not os.path.exists(req_path):
+        raise FileNotFoundError(f"requirements.txt not found at {req_path}")
+    with open(req_path, "r", encoding="utf-8") as f:
+        requirements = []
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            requirements.append(line)
+    return requirements
+
+build_script_path = os.path.join(os.path.abspath(os.getcwd()), 'build')
+
+subprocess.check_call(['bash', './build_plugin.sh'], cwd=build_script_path)
+
+source_dir = os.path.join(build_script_path, 'build')  # .so文件位于csrc/build/
+destination_dir = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'plugin')  # 目标位置为mindiesd/plugin/
+copy_so_files(source_dir, destination_dir)
+
+
+src_vendors = os.path.join(build_script_path, 'pkg')
+dest_ops = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'ops')
+copy_vendors_to_ops(src_vendors, dest_ops)
+
+req_path = os.path.join(os.path.abspath(os.getcwd()), "requirements.txt")
+requirements = get_requirements(req_path)
+
+# 创建一个参数解析实例
+parser = argparse.ArgumentParser(description="Setup Parameters")
+parser.add_argument("--setup_cmd", type=str, default="bdist_wheel")
+parser.add_argument("--version", type=str, default="1.0.RC1")
+
+# 开始解析
+args, unknown = parser.parse_known_args()
+# 把路径参数从系统命令中移除，只保留setup需要的参数
+sys.argv = [sys.argv[0], args.setup_cmd] + unknown
+logging.info(sys.argv)
+
+mindie_sd_version = args.version
+
+setup(
+    name="mindiesd",
+    version=mindie_sd_version,
+    author="ascend",
+    description="build wheel for mindie sd",
+    setup_requires=[],
+    install_requires=requirements,
+    zip_safe=False,
+    python_requires=">=3.10",
+    include_package_data=True,
+    packages=find_packages(),
+    package_data={
+        "": [
+            "*.so",  
+            "ops/**/*"
+        ]
+    },
+)
+```
