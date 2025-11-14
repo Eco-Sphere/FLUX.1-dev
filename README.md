@@ -584,183 +584,892 @@ python hpsv2_score.py \
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
 ```shell
-set -e
-BUILD_DIR=$(dirname $(readlink -f $0))
-PROJ_ROOT_DIR=${BUILD_DIR}/..
-export OUTPUT_DIR=$PROJ_ROOT_DIR/output
+#ifndef PYTORCH_NPU_HELPER_HPP_
+#define PYTORCH_NPU_HELPER_HPP_
 
-if [ ! -d "$OUTPUT_DIR" ];then
-    mkdir -p $OUTPUT_DIR
-fi
+#include <ATen/Tensor.h>
+#include <acl/acl_base.h>
+#include <acl/acl_rt.h>
+#include <aclnn/aclnn_base.h>
+#include <c10/util/Exception.h>
+#include <dlfcn.h>
+#include <torch/extension.h>
+#include <torch_npu/csrc/framework/utils/CalcuOpUtil.h>
+#include <torch_npu/csrc/framework/utils/OpAdapter.h>
 
-AFT_PATH=${PROJ_ROOT_DIR}
-chmod a-w $BUILD_DIR/*
+#include <fstream>
+#include <functional>
+#include <type_traits>
+#include <vector>
+#include <string_view>
+#include <utility>
+#include <tuple>
 
-rm -rf ${PROJ_ROOT_DIR}/dist/*
-cd ${PROJ_ROOT_DIR}
-MindIESDVersion="1.0.RC1"
-if [ ! -f "${PROJ_ROOT_DIR}"/../CI/config/version.ini ]; then
-    echo "version.ini is not exsited !"
-else
-    MindIESDVersion=$(cat ${PROJ_ROOT_DIR}/../CI/config/version.ini | grep "PackageName" | cut -d "=" -f 2)
-fi
-MindIESDVersion=$(echo $MindIESDVersion | sed -E 's/([0-9]+)\.([0-9]+)\.RC([0-9]+)\.([0-9]+)/\1.\2rc\3.post\4/')
-MindIESDWheelVersion=$(echo $MindIESDVersion | sed -s 's!.T!.alpha!')
-MindIESDVersion=$(echo $MindIESDVersion | sed -s 's!.T!+t!')
-echo "MindIESDVersion $MindIESDVersion"
-echo "MindIESDWheelVersion $MindIESDWheelVersion"
+#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUFormat.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
+#include "torch_npu/csrc/framework/interface/EnvVariables.h"
+#include "torch_npu/csrc/framework/utils/CalcuOpUtil.h"
+#include "torch_npu/csrc/framework/utils/OpPreparation.h"
 
-# "aarch64" / "x86_64"
-ARCH=$(uname -m)
-if [[ "${ARCH}" != "aarch64" && "${ARCH}" != "x86_64" ]]; then
-    echo "It is not system of aarch64 or x86_64"
-    exit 1
-fi
+#define NPU_NAME_SPACE at_npu::native
 
-PYTHON_VERSION=""
-if command -v python3 &> /dev/null; then
-    version=$(python3 --version | awk '{print$2}')
-    major=$(echo $version | cut -d '.' -f 1)
-    minor=$(echo $version | cut -d '.' -f 2)
-    PYTHON_VERSION="py${major}${minor}"
-    echo "python version is: $PYTHON_VERSION"
-else
-    echo "cannot get python version"
-    exit 1
-fi
+using AclOpExecutor = struct aclOpExecutor;
+using AclTensor = struct aclTensor;
+using AclScalar = struct aclScalar;
+using AclIntArray = struct aclIntArray;
+using AclFloatArray = struct aclFloatArray;
+using AclBoolArray = struct aclBoolArray;
+using AclTensorList = struct aclTensorList;
 
-rm -rf $OUTPUT_DIR/*
-mkdir -p $OUTPUT_DIR/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
-# cp ${PROJ_ROOT_DIR}/dist/mindie*.whl ${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
-cp ${PROJ_ROOT_DIR}/requirements.txt ${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+template<typename T = void>
+using FunctionPtr = T*;
+constexpr int K_HASH_BUF_SIZE = 8192;
+constexpr int K_HASH_BUF_MAX_SIZE = K_HASH_BUF_SIZE + 1024;
+constexpr int64_t ACL_TENSOR_MAX_DIM_FOR_FORMAT = 5;
+constexpr int64_t DIM_NUM_3D = 3;
+constexpr int64_t DIM_NUM_4D = 4;
+constexpr int64_t DIM_NUM_5D = 5;
+extern thread_local char g_hashBuf[K_HASH_BUF_SIZE];
+extern thread_local int g_hashOffset;
 
-if [ -n "$AFT_PATH" ] && [ -d "$AFT_PATH" ]; then
-    export RELEASE_TMP_DIR=${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
-    source ${AFT_PATH}/build/build_ops.sh ${AFT_PATH}/build
-    SET_ENV_PATH=${OUTPUT_DIR}/Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}/set_env.sh
-    touch ${SET_ENV_PATH}
-    echo "path=\${BASH_SOURCE[0]}" >> ${SET_ENV_PATH}
-    echo "SD_OPS_HOME=\$(cd \$(dirname \$path); pwd )" >> ${SET_ENV_PATH}
-    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/customize:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
-    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/aie_ascendc:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
-elif [ -n "$AFT_PATH" ]; then
-    echo "Waring: The path of ascend-faster-transformer $AFT_PATH does not exist."
-fi
+template <std::string_view const& ApiName>
+constexpr auto GetWorkspaceSizeApiName()
+{
+    constexpr std::string_view suffix = "GetWorkspaceSize";
+    std::array<char, ApiName.size() + suffix.size() + 1> buf{};
+    size_t idx = 0;
+    for (; idx < ApiName.size(); ++idx) {
+        buf[idx] = ApiName[idx];
+    }
+    for (size_t j = 0; j < suffix.size(); ++j) {
+        buf[idx + j] = suffix[j];
+    }
+    buf[idx + suffix.size()] = '\0';
+    return buf;
+}
 
-cd ${PROJ_ROOT_DIR}
-python3 ${PROJ_ROOT_DIR}/setup.py --setup_cmd='bdist_wheel' --version=${MindIESDWheelVersion}
+inline std::vector<std::string> SplitStr(std::string s, const std::string &del)
+{
+    int end = s.find(del);
+    std::vector<std::string> path_list;
+    while (end != -1) {
+        path_list.push_back(s.substr(0, end));
+        s.erase(s.begin(), s.begin() + end + 1);
+        end = s.find(del);
+    }
+    path_list.push_back(s);
+    return path_list;
+}
 
-cd $OUTPUT_DIR
-tar_package_name="Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}.tar.gz"
-tar czf $tar_package_name ./Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH} --owner=0 --group=0
-rm -rf ./Ascend-mindie-sd_${MindIESDVersion}_${PYTHON_VERSION}_linux_${ARCH}
+inline bool IsFileExist(const std::string &path)
+{
+    if (path.empty() || path.size() > PATH_MAX) {
+        return false;
+    }
+    return (access(path.c_str(), F_OK) == 0) ? true : false;
+}
 
-import logging
-import os
-import sys
-import shutil
-import argparse
-import subprocess
-from setuptools import setup, find_packages, Extension
+inline std::string RealPath(const std::string &path)
+{
+    if (path.empty() || path.size() > PATH_MAX) {
+        return "";
+    }
+    char realPathBuf[PATH_MAX] = {0};
+    if (realpath(path.c_str(), realPathBuf) == nullptr) {
+        return "";
+    }
+    return std::string(realPathBuf);
+}
+inline std::vector<std::string> ProcessPathList(const std::string& pathStr)
+{
+    return SplitStr(pathStr, ":");
+}
+inline void AppendLibPathSuffix(std::vector<std::string>& pathList)
+{
+    for (auto &it : pathList) {
+        it = it + "/op_api/lib/";
+    }
+}
+std::vector<std::string> ProcessCustomLibPath(const char* ascendCustomOppPath);
+inline std::vector<std::string> ProcessCustomLibPath(const char* ascendCustomOppPath)
+{
+    std::string ascendCustomOppPathStr(ascendCustomOppPath);
+    auto customLibPathList = ProcessPathList(ascendCustomOppPathStr);
+    if (customLibPathList.empty()) {
+        return std::vector<std::string>();
+    }
+    AppendLibPathSuffix(customLibPathList);
+    return customLibPathList;
+}
+inline std::vector<std::string> GetCustomLibPath()
+{
+    const char *ascendCustomOppPath = std::getenv("ASCEND_CUSTOM_OPP_PATH");
+    if (ascendCustomOppPath == nullptr) {
+        ASCEND_LOGW("ASCEND_CUSTOM_OPP_PATH is not exists");
+        return std::vector<std::string>();
+    }
+    return ProcessCustomLibPath(ascendCustomOppPath);
+}
+std::vector<std::string> ProcessVendorsList(const std::string& vendorsPath, const std::string& line);
+inline std::vector<std::string> ProcessVendorsList(const std::string& vendorsPath, const std::string& line)
+{
+    auto defaultVendorsList = SplitStr(line, ",");
+    for (auto &it : defaultVendorsList) {
+        it = RealPath(vendorsPath + "/" + it + "/op_api/lib/");
+    }
+    return defaultVendorsList;
+}
 
-os.environ["SOURCE_DATE_EPOCH"] = "0"
+inline std::string GetVendorsConfigFilePath(const std::string& vendorsPath)
+{
+    return RealPath(vendorsPath + "/config.ini");
+}
 
+inline bool ValidateVendorsConfigFile(const std::string& configFile)
+{
+    if (configFile.empty() || !IsFileExist(configFile)) {
+        ASCEND_LOGW("config.ini is not exists or the path length is more than %d", PATH_MAX);
+        return false;
+    }
+    return true;
+}
 
-def copy_so_files(src_dir, dest_dir):
-    # 确保目标目录存在
-    if not os.path.exists(dest_dir):
-        os.makedirs(dest_dir)
+inline std::string ReadLoadPriorityLine(const std::string& configFile)
+{
+    std::ifstream ifs(configFile);
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.find("load_priority=") == 0) {
+            break;
+        }
+    }
+    return line;
+}
 
-    # 构建cp命令
-    so_files = [f for f in os.listdir(src_dir) if f.endswith('.so')]
-    if not so_files:
-        logging.warning(f"No .so files found in {src_dir}")
-        return
+inline std::string ExtractLoadPriorityValue(const std::string& line)
+{
+    std::string head = "load_priority=";
+    std::string result = line;
+    if (result.find(head) == 0) {
+        result.erase(0, head.length());
+    }
+    return result;
+}
+std::vector<std::string> ParseVendorsConfig(const std::string& vendorsPath);
+inline std::vector<std::string> ParseVendorsConfig(const std::string& vendorsPath)
+{
+    std::string vendorsConfigFile = GetVendorsConfigFilePath(vendorsPath);
+    if (!ValidateVendorsConfigFile(vendorsConfigFile)) {
+        return {};
+    }
+    std::string line = ReadLoadPriorityLine(vendorsConfigFile);
+    std::string priorityValue = ExtractLoadPriorityValue(line);
+    return ProcessVendorsList(vendorsPath, priorityValue);
+}
+inline std::vector<std::string> GetDefaultCustomLibPath()
+{
+    const char *ascendOppPath = std::getenv("ASCEND_OPP_PATH");
+    std::vector<std::string> defaultVendorsList;
+    if (ascendOppPath == nullptr) {
+        ASCEND_LOGW("ASCEND_OPP_PATH is not exists");
+        return std::vector<std::string>();
+    }
+    std::string vendorsPath(ascendOppPath);
+    vendorsPath = vendorsPath + "/vendors";
+    return ParseVendorsConfig(vendorsPath);
+}
 
-    for so_file in so_files:
-        src_file = os.path.join(src_dir, so_file)
-        dest_file = os.path.join(dest_dir, so_file)
-        # 使用subprocess调用cp命令
-        subprocess.check_call(['/bin/cp', '-v', src_file, dest_file])  # -v选项用于显示详细信息
-        logging.info(f"Copied {src_file} to {dest_file}")
+const std::vector<std::string> g_customLibPath = GetCustomLibPath();
+const std::vector<std::string> g_defaultCustomLibPath = GetDefaultCustomLibPath();
 
-def copy_vendors_to_ops(src_dir, dest_dir):
-    if os.path.exists(dest_dir):
-        logging.info(f"Target directory {dest_dir} exists, deleting...")
-        shutil.rmtree(dest_dir)  
+constexpr aclDataType K_ATEN_SCALAR_TYPE_TO_ACL_DATATYPE_TABLE[static_cast<int64_t>(at::ScalarType::NumOptions) + 1] = {
+    ACL_UINT8,
+    ACL_INT8,
+    ACL_INT16,
+    ACL_INT32,
+    ACL_INT64,
+    ACL_FLOAT16,
+    ACL_FLOAT,
+    ACL_DOUBLE,
+    ACL_DT_UNDEFINED,
+    ACL_COMPLEX64,
+    ACL_COMPLEX128,
+    ACL_BOOL,
+    ACL_DT_UNDEFINED,
+    ACL_DT_UNDEFINED,
+    ACL_DT_UNDEFINED,
+    ACL_BF16,
+    ACL_DT_UNDEFINED,
+    ACL_DT_UNDEFINED,
+    ACL_DT_UNDEFINED,
+    ACL_DT_UNDEFINED
+};
 
-    os.makedirs(dest_dir)
-    logging.info(f"Created new target directory: {dest_dir}")
+template<typename T>
+inline bool CheckDataPointer(const T* data)
+{
+    if (data == nullptr) {
+        TORCH_CHECK(false, "memcpy failed: source data is null pointer");
+        return false;
+    }
+    return true;
+}
+inline bool CheckDataSize(size_t size)
+{
+    if (size == 0) {
+        TORCH_CHECK(false, "memcpy failed: copy size is 0 (no data to copy)");
+        return false;
+    }
+    return true;
+}
+inline bool CheckBufferSpace(size_t size)
+{
+    if (g_hashOffset + size > K_HASH_BUF_SIZE) {
+        g_hashOffset = K_HASH_BUF_MAX_SIZE;
+        TORCH_CHECK(false, "memcpy failed: buffer overflow");
+        return false;
+    }
+    return true;
+}
+template<typename T>
+inline bool ValidateMemcpyParams(const T* data, size_t size)
+{
+    return CheckDataPointer(data) && CheckDataSize(size) && CheckBufferSpace(size);
+}
 
-    if not os.path.exists(src_dir):
-        logging.warning(f"Source vendors directory not found: {src_dir}")
-        return
+inline const char *GetOpApiLibName(void)
+{
+    return "libopapi.so";
+}
 
-    cmd = f'/bin/cp -r -v "{src_dir}"/* "{dest_dir}"'
-    try:
-        subprocess.check_call(cmd, shell=True)
-        logging.info(f"Successfully copied all content from {src_dir} to {dest_dir}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to copy vendors directory: {e}")
-        raise  
+inline const char *GetCustOpApiLibName(void)
+{
+    return "libcust_opapi.so";
+}
 
-def get_requirements(req_path):
-    if not os.path.exists(req_path):
-        raise FileNotFoundError(f"requirements.txt not found at {req_path}")
-    with open(req_path, "r", encoding="utf-8") as f:
-        requirements = []
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            requirements.append(line)
-    return requirements
+template<typename T = void>
+inline void *GetOpApiFuncAddrInLib(T *handler, const char *libName, const char *apiName)
+{
+    auto funcAddr = dlsym(handler, apiName);
+    if (funcAddr == nullptr) {
+        ASCEND_LOGW("dlsym %s from %s failed, error:%s.", apiName, libName, dlerror());
+    }
+    return funcAddr;
+}
 
-build_script_path = os.path.join(os.path.abspath(os.getcwd()), 'build')
+inline void *GetOpApiLibHandler(const char *libName)
+{
+    auto handler = dlopen(libName, RTLD_LAZY);
+    if (handler == nullptr) {
+        ASCEND_LOGW("dlopen %s failed, error:%s.", libName, dlerror());
+    }
+    return handler;
+}
+inline bool IsCustomLibPathEmpty()
+{
+    return g_customLibPath.empty();
+}
 
-subprocess.check_call(['bash', './build_plugin.sh'], cwd=build_script_path)
+inline std::string GetCustomOpApiLibPath(const std::string& libPath)
+{
+    return RealPath(libPath + "/" + GetCustOpApiLibName());
+}
 
-source_dir = os.path.join(build_script_path, 'build')  # .so文件位于csrc/build/
-destination_dir = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'plugin')  # 目标位置为mindiesd/plugin/
-copy_so_files(source_dir, destination_dir)
+inline void* LoadCustomOpApiHandler(const std::string& custOpApiLib)
+{
+    if (custOpApiLib.empty()) {
+        return nullptr;
+    }
+    return GetOpApiLibHandler(custOpApiLib.c_str());
+}
 
+inline void* FindFuncInCustomLibPath(const char* apiName, const std::string& libPath)
+{
+    auto custOpApiLib = GetCustomOpApiLibPath(libPath);
+    auto custOpApiHandler = LoadCustomOpApiHandler(custOpApiLib);
+    if (custOpApiHandler != nullptr) {
+        auto funcAddr = GetOpApiFuncAddrInLib(custOpApiHandler, GetCustOpApiLibName(), apiName);
+        if (funcAddr != nullptr) {
+            ASCEND_LOGI("%s is found in %s.", apiName, custOpApiLib.c_str());
+            return funcAddr;
+        }
+    }
+    return nullptr;
+}
+inline bool ShouldSearchCustomLib()
+{
+    return !IsCustomLibPathEmpty();
+}
+inline void* SearchCustomLibPaths(const char* apiName)
+{
+    for (const auto &libPath : g_customLibPath) {
+        void* funcAddr = FindFuncInCustomLibPath(apiName, libPath);
+        if (funcAddr != nullptr) {
+            return funcAddr;
+        }
+    }
+    return nullptr;
+}
 
-src_vendors = os.path.join(build_script_path, 'pkg')
-dest_ops = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'ops')
-copy_vendors_to_ops(src_vendors, dest_ops)
+inline void LogCustomLibNotFound(const char* apiName)
+{
+    ASCEND_LOGI("%s is not in custom lib.", apiName);
+}
+inline void* FindFuncInCustomLib(const char* apiName)
+{
+    if (!ShouldSearchCustomLib()) {
+        return nullptr;
+    }
+    
+    void* result = SearchCustomLibPaths(apiName);
+    if (result == nullptr) {
+        LogCustomLibNotFound(apiName);
+    }
+    return result;
+}
+inline bool IsDefaultCustomLibPathEmpty()
+{
+    return g_defaultCustomLibPath.empty();
+}
+inline std::string GetDefaultCustomOpApiLibPath(const std::string& libPath)
+{
+    return RealPath(libPath + "/" + GetCustOpApiLibName());
+}
+inline void* LoadDefaultCustomOpApiHandler(const std::string& defaultCustOpApiLib)
+{
+    if (defaultCustOpApiLib.empty()) {
+        return nullptr;
+    }
+    return GetOpApiLibHandler(defaultCustOpApiLib.c_str());
+}
+inline void* FindFuncInDefaultLibPath(const char* apiName, const std::string& libPath)
+{
+    auto defaultCustOpApiLib = GetDefaultCustomOpApiLibPath(libPath);
+    auto custOpApiHandler = LoadDefaultCustomOpApiHandler(defaultCustOpApiLib);
+    if (custOpApiHandler != nullptr) {
+        auto funcAddr = GetOpApiFuncAddrInLib(custOpApiHandler, GetCustOpApiLibName(), apiName);
+        if (funcAddr != nullptr) {
+            ASCEND_LOGI("%s is found in %s.", apiName, defaultCustOpApiLib.c_str());
+            return funcAddr;
+        }
+    }
+    return nullptr;
+}
+inline bool ShouldSearchDefaultLib()
+{
+    return !IsDefaultCustomLibPathEmpty();
+}
+inline void* SearchDefaultLibPaths(const char* apiName)
+{
+    for (const auto &libPath : g_defaultCustomLibPath) {
+        void* funcAddr = FindFuncInDefaultLibPath(apiName, libPath);
+        if (funcAddr != nullptr) {
+            return funcAddr;
+        }
+    }
+    return nullptr;
+}
+inline void LogDefaultLibNotFound(const char* apiName)
+{
+    ASCEND_LOGI("%s is not in default custom lib.", apiName);
+}
+inline void* FindFuncInDefaultLib(const char* apiName)
+{
+    if (!ShouldSearchDefaultLib()) {
+        return nullptr;
+    }
+    void* result = SearchDefaultLibPaths(apiName);
+    if (result == nullptr) {
+        LogDefaultLibNotFound(apiName);
+    }
+    return result;
+}
+inline void* GetFuncFromDefaultLib(const char* apiName)
+{
+    static auto opApiHandler = GetOpApiLibHandler(GetOpApiLibName());
+    if (opApiHandler == nullptr) {
+        return nullptr;
+    }
+    return GetOpApiFuncAddrInLib(opApiHandler, GetOpApiLibName(), apiName);
+}
+inline void *GetOpApiFuncAddr(const char *apiName)
+{
+    void* funcAddr = FindFuncInCustomLib(apiName);
+    if (funcAddr != nullptr) {
+        return funcAddr;
+    }
+    funcAddr = FindFuncInDefaultLib(apiName);
+    if (funcAddr != nullptr) {
+        return funcAddr;
+    }
+    return GetFuncFromDefaultLib(apiName);
+}
+c10::Scalar CreateScalarFromDouble(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromLong(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromFloat(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromInt(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromHalf(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromBool(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromComplexDouble(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromComplexFloat(const at::Tensor* tensor);
+c10::Scalar CreateScalarFromBFloat16(const at::Tensor* tensor);
+inline c10::Scalar CreateScalarFromDouble(const at::Tensor* aclInput)
+{
+    double value = *(double *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
 
-req_path = os.path.join(os.path.abspath(os.getcwd()), "requirements.txt")
-requirements = get_requirements(req_path)
+inline c10::Scalar CreateScalarFromLong(const at::Tensor* aclInput)
+{
+    int64_t value = *(int64_t *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
 
-# 创建一个参数解析实例
-parser = argparse.ArgumentParser(description="Setup Parameters")
-parser.add_argument("--setup_cmd", type=str, default="bdist_wheel")
-parser.add_argument("--version", type=str, default="1.0.RC1")
+inline c10::Scalar CreateScalarFromFloat(const at::Tensor* aclInput)
+{
+    float value = *(float *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
 
-# 开始解析
-args, unknown = parser.parse_known_args()
-# 把路径参数从系统命令中移除，只保留setup需要的参数
-sys.argv = [sys.argv[0], args.setup_cmd] + unknown
-logging.info(sys.argv)
+inline c10::Scalar CreateScalarFromInt(const at::Tensor* aclInput)
+{
+    int value = *(int *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
 
-mindie_sd_version = args.version
+inline c10::Scalar CreateScalarFromHalf(const at::Tensor* aclInput)
+{
+    c10::Half value = *(c10::Half *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
 
-setup(
-    name="mindiesd",
-    version=mindie_sd_version,
-    author="ascend",
-    description="build wheel for mindie sd",
-    setup_requires=[],
-    install_requires=requirements,
-    zip_safe=False,
-    python_requires=">=3.10",
-    include_package_data=True,
-    packages=find_packages(),
-    package_data={
-        "": [
-            "*.so",  
-            "ops/**/*"
-        ]
-    },
-)
+inline c10::Scalar CreateScalarFromBool(const at::Tensor* aclInput)
+{
+    int8_t value = *(int8_t *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
+
+inline c10::Scalar CreateScalarFromComplexDouble(const at::Tensor* aclInput)
+{
+    c10::complex<double> value = *(c10::complex<double> *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
+
+inline c10::Scalar CreateScalarFromComplexFloat(const at::Tensor* aclInput)
+{
+    c10::complex<float> value = *(c10::complex<float> *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
+
+inline c10::Scalar CreateScalarFromBFloat16(const at::Tensor* aclInput)
+{
+    c10::BFloat16 value = *(c10::BFloat16 *)aclInput->data_ptr();
+    return c10::Scalar(value);
+}
+c10::Scalar ConvertTensorToScalar(const at::Tensor &tensor)
+{
+    const at::Tensor *aclInput = &tensor;
+    switch (aclInput->scalar_type()) {
+        case at::ScalarType::Double:
+            return CreateScalarFromDouble(aclInput);
+        case at::ScalarType::Long:
+            return CreateScalarFromLong(aclInput);
+        case at::ScalarType::Float:
+            return CreateScalarFromFloat(aclInput);
+        case at::ScalarType::Int:
+            return CreateScalarFromInt(aclInput);
+        case at::ScalarType::Half:
+            return CreateScalarFromHalf(aclInput);
+        case at::ScalarType::Bool:
+            return CreateScalarFromBool(aclInput);
+        case at::ScalarType::ComplexDouble:
+            return CreateScalarFromComplexDouble(aclInput);
+        case at::ScalarType::ComplexFloat:
+            return CreateScalarFromComplexFloat(aclInput);
+        case at::ScalarType::BFloat16:
+            return CreateScalarFromBFloat16(aclInput);
+        default:
+            return c10::Scalar();
+    }
+}
+inline at::Tensor CopyTensorHostToDevice(const at::Tensor &cpuTensor)
+{
+    at::Tensor cpuPinMemTensor = cpuTensor.pin_memory();
+    int deviceIndex = 0;
+    return cpuPinMemTensor.to(c10::Device(torch_npu::utils::get_npu_device_type(), deviceIndex),
+                              cpuPinMemTensor.scalar_type(), true, true);
+}
+
+inline at::Tensor CopyScalarToDevice(const c10::Scalar &cpuScalar, at::ScalarType scalarDataType)
+{
+    return CopyTensorHostToDevice(scalar_to_tensor(cpuScalar).to(scalarDataType));
+}
+
+AclTensor *ConvertType(const at::Tensor &atTensor)
+{
+    if (!atTensor.defined()) {
+        return nullptr;
+    }
+    at::ScalarType scalarDataType = atTensor.scalar_type();
+    aclDataType aclType = K_ATEN_SCALAR_TYPE_TO_ACL_DATATYPE_TABLE[static_cast<int64_t>(scalarDataType)];
+    TORCH_CHECK(aclType != ACL_DT_UNDEFINED,
+                std::string(c10::toString(scalarDataType)) + " has not been supported")
+    c10::SmallVector<int64_t, ACL_TENSOR_MAX_DIM_FOR_FORMAT> storageDims;
+    // if aclType is ACL_STRING, storageDims is empty.
+    auto itemSize = atTensor.itemsize();
+    if (itemSize == 0) {
+        AT_ERROR("When ConvertType, tensor item size of cannot be zero.");
+        return nullptr;
+    }
+    if (aclType != ACL_STRING) {
+        storageDims.push_back(atTensor.storage().nbytes() / itemSize);
+    }
+
+    const auto dimNum = atTensor.sizes().size();
+    aclFormat format = ACL_FORMAT_ND;
+    switch (dimNum) {
+        case DIM_NUM_3D:
+            format = ACL_FORMAT_NCL;
+            break;
+        case DIM_NUM_4D:
+            format = ACL_FORMAT_NCHW;
+            break;
+        case DIM_NUM_5D:
+            format = ACL_FORMAT_NCDHW;
+            break;
+        default:
+            format = ACL_FORMAT_ND;
+    }
+
+    if (atTensor.unsafeGetTensorImpl()->is_wrapped_number()) {
+        c10::Scalar expScalar = ConvertTensorToScalar(atTensor);
+        at::Tensor aclInput = CopyScalarToDevice(expScalar, scalarDataType);
+        return aclCreateTensor(aclInput.sizes().data(), aclInput.sizes().size(), aclType,
+                               aclInput.strides().data(), aclInput.storage_offset(), format, storageDims.data(),
+                               storageDims.size(), const_cast<void *>(aclInput.storage().data()));
+    }
+
+    auto aclTensorObj =
+        aclCreateTensor(atTensor.sizes().data(), atTensor.sizes().size(), aclType, atTensor.strides().data(),
+                        atTensor.storage_offset(), format, storageDims.data(), storageDims.size(),
+                        const_cast<void *>(atTensor.storage().data()));
+    return aclTensorObj;
+}
+
+AclScalar *ConvertType(const at::Scalar &atScalar)
+{
+    at::ScalarType scalarDataType = atScalar.type();
+    aclDataType aclType = K_ATEN_SCALAR_TYPE_TO_ACL_DATATYPE_TABLE[static_cast<int64_t>(scalarDataType)];
+    TORCH_CHECK(aclType != ACL_DT_UNDEFINED,
+                std::string(c10::toString(scalarDataType)) + " has not been supported")
+    AclScalar *aclScalarObj = nullptr;
+    switch (scalarDataType) {
+        case at::ScalarType::Double: {
+            double value = atScalar.toDouble();
+            aclScalarObj = aclCreateScalar(&value, aclType);
+            break;
+        }
+        case at::ScalarType::Long: {
+            int64_t value = atScalar.toLong();
+            aclScalarObj = aclCreateScalar(&value, aclType);
+            break;
+        }
+        case at::ScalarType::Bool: {
+            bool value = atScalar.toBool();
+            aclScalarObj = aclCreateScalar(&value, aclType);
+            break;
+        }
+        case at::ScalarType::ComplexDouble: {
+            auto value = atScalar.toComplexDouble();
+            aclScalarObj = aclCreateScalar(&value, aclType);
+            break;
+        }
+        default:
+            aclScalarObj = nullptr;
+            break;
+    }
+    return aclScalarObj;
+}
+
+inline AclIntArray *ConvertType(const at::IntArrayRef &atArray)
+{
+    auto array = aclCreateIntArray(atArray.data(), atArray.size());
+    return array;
+}
+
+template <std::size_t N> inline AclBoolArray *ConvertType(const std::array<bool, N> &value)
+{
+    auto array = aclCreateBoolArray(value.data(), value.size());
+    return array;
+}
+
+inline AclBoolArray *ConvertType(const at::ArrayRef<bool> &value)
+{
+    auto array = aclCreateBoolArray(value.data(), value.size());
+    return array;
+}
+
+inline AclTensorList *ConvertType(const at::TensorList &atTensorList)
+{
+    std::vector<const AclTensor *> tensorTist(atTensorList.size());
+    for (size_t i = 0; i < atTensorList.size(); i++) {
+        tensorTist[i] = ConvertType(atTensorList[i]);
+    }
+    auto aclTensorList = aclCreateTensorList(tensorTist.data(), tensorTist.size());
+    return aclTensorList;
+}
+
+inline AclTensor *ConvertType(const c10::optional<at::Tensor> &optTensor)
+{
+    if (optTensor.has_value() && optTensor.value().defined()) {
+        return ConvertType(optTensor.value());
+    }
+    return nullptr;
+}
+
+inline AclIntArray *ConvertType(const c10::optional<at::IntArrayRef> &optArray)
+{
+    if (optArray.has_value()) {
+        return ConvertType(optArray.value());
+    }
+    return nullptr;
+}
+
+inline AclScalar *ConvertType(const c10::optional<at::Scalar> &optScalar)
+{
+    if (optScalar.has_value()) {
+        return ConvertType(optScalar.value());
+    }
+    return nullptr;
+}
+
+inline aclDataType ConvertType(const at::ScalarType scalarType)
+{
+    return K_ATEN_SCALAR_TYPE_TO_ACL_DATATYPE_TABLE[static_cast<int64_t>(scalarType)];
+}
+
+template <typename T> T ConvertType(T value)
+{
+    return value;
+}
+
+template <typename Tuple, size_t... I, typename FuncPtrType>
+auto ConvertToOpApiFunc(const Tuple &params, FuncPtrType *opApiAddr, std::index_sequence<I...>)
+{
+    using OpApiFunc = int (*)(typename std::decay<decltype(std::get<I>(params))>::type...);
+    auto func = reinterpret_cast<OpApiFunc>(opApiAddr);
+    return func;
+}
+
+template <typename Tuple, typename FuncPtrType>
+auto ConvertToOpApiFunc(const Tuple &params, FuncPtrType *opApiAddr)
+{
+    static constexpr auto size = std::tuple_size<Tuple>::value;
+    return ConvertToOpApiFunc(params, opApiAddr, std::make_index_sequence<size>{});
+}
+
+inline void Release(AclTensor *p)
+{
+    aclDestroyTensor(p);
+}
+
+inline void Release(AclScalar *p)
+{
+    aclDestroyScalar(p);
+}
+
+inline void Release(AclIntArray *p)
+{
+    aclDestroyIntArray(p);
+}
+
+inline void Release(AclBoolArray *p)
+{
+    aclDestroyBoolArray(p);
+}
+
+inline void Release(AclTensorList *p)
+{
+    aclDestroyTensorList(p);
+}
+
+template <typename T> void Release(T value)
+{
+    (void)value;
+}
+
+template <typename Tuple, size_t... I> void CallRelease(Tuple t, std::index_sequence<I...>)
+{
+    (void)std::initializer_list<int>{(Release(std::get<I>(t)), 0)...};
+}
+
+template <typename Tuple> void ReleaseConvertTypes(Tuple &t)
+{
+    static constexpr auto size = std::tuple_size<Tuple>::value;
+    CallRelease(t, std::make_index_sequence<size>{});
+}
+
+template <typename... Ts> constexpr auto ConvertTypes(Ts &...args)
+{
+    return std::make_tuple(ConvertType(args)...);
+}
+
+template <typename Function, typename Tuple, size_t... I> auto Call(Function f, Tuple t, std::index_sequence<I...>)
+{
+    return f(std::get<I>(t)...);
+}
+
+template <typename Function, typename Tuple> auto Call(Function f, Tuple t)
+{
+    static constexpr auto size = std::tuple_size<Tuple>::value;
+    return Call(f, t, std::make_index_sequence<size>{});
+}
+
+uint64_t CalcHashId();
+using InitHugeMemThreadLocal = int (*)(void *, bool);
+using UnInitHugeMemThreadLocal = void (*)(void *, bool);
+using ReleaseHugeMem = void (*)(void *, bool);
+
+static void ValidateApiAddresses(
+    const void* getWorkspaceSizeFuncAddr, 
+    const void* opApiFuncAddr,
+    std::string_view apiName,
+    std::string_view workspaceSizeApiStr)
+{
+    TORCH_CHECK(
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,
+        apiName.data(), " or ", workspaceSizeApiStr.data(), " not in ", GetOpApiLibName(),
+        ", or ", GetOpApiLibName(), " not found."
+    );
+}
+
+static void InitHugeMem(const void* initMemAddr)
+{
+    using InitHugeMemFunc = int (*)(FunctionPtr<>, bool);
+    InitHugeMemFunc initMemFunc = reinterpret_cast<InitHugeMemFunc>(initMemAddr);
+    if (initMemFunc) {
+        initMemFunc(nullptr, false);
+    }
+}
+
+template <std::string_view const& ApiName, typename GetWorkspaceSizeFuncType, typename... Args>
+static auto PrepareParamsAndCalcWorkspaceSize(
+    uint64_t* workspaceSizeAddr, AclOpExecutor** executorAddr,
+    GetWorkspaceSizeFuncType getWorkspaceSizeFuncAddr, Args&&... args)
+{
+    auto convertedParams = ConvertTypes(std::forward<Args>(args)..., workspaceSizeAddr, executorAddr);
+    static auto getWorkspaceSizeFunc = ConvertToOpApiFunc(convertedParams, getWorkspaceSizeFuncAddr);
+    auto workspaceStatus = Call(getWorkspaceSizeFunc, convertedParams);
+
+    TORCH_CHECK(
+        workspaceStatus == 0,
+        "call ", ApiName.data(), " failed, detail:", aclGetRecentErrMsg()
+    );
+
+    return convertedParams;
+}
+
+static void* AllocateWorkspace(uint64_t workspaceSize, at::Tensor& workspaceTensor)
+{
+    if (workspaceSize == 0) {
+        return nullptr;
+    }
+
+    at::TensorOptions options = at::TensorOptions(torch_npu::utils::get_npu_device_type());
+    workspaceTensor = at::empty({workspaceSize}, options.dtype(c10::kByte));
+    return const_cast<void*>(workspaceTensor.storage().data());
+}
+
+template <typename ReleaseMemAddrType>
+static void ReleaseHugeMemResource(ReleaseMemAddrType releaseMemAddr)
+{
+    using ReleaseHugeMemFunc = void (*)(FunctionPtr<>, bool);
+    ReleaseHugeMemFunc releaseMemFunc = reinterpret_cast<ReleaseHugeMemFunc>(releaseMemAddr);
+    if (releaseMemFunc) {
+        releaseMemFunc(nullptr, false);
+    }
+}
+
+template <
+    std::string_view const& ApiName, 
+    typename ConvertedParamsType, 
+    typename OpApiFuncAddrType, 
+    typename ReleaseMemAddrType
+    >
+static void RunOpCommand(
+    aclrtStream aclStreamObj, void* workspaceAddr, uint64_t workspaceSize,
+    AclOpExecutor* executor, ConvertedParamsType convertedParams, OpApiFuncAddrType opApiFuncAddr,
+    ReleaseMemAddrType releaseMemAddr)
+{
+    auto aclCall = [=]() -> int {
+        using OpApiFunc = int (*)(FunctionPtr<>, uint64_t, AclOpExecutor*, const aclrtStream);
+        OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);
+        auto apiRet = opApiFunc(workspaceAddr, workspaceSize, executor, aclStreamObj);
+
+        TORCH_CHECK(
+            apiRet == 0,
+            "call ", ApiName.data(), " failed, detail:", aclGetRecentErrMsg()
+        );
+
+        ReleaseConvertTypes(convertedParams);
+        ReleaseHugeMemResource(releaseMemAddr);
+        return apiRet;
+    };
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name(ApiName.data());
+    cmd.SetCustomHandler(aclCall);
+    cmd.Run();
+}
+
+template <typename UnInitMemAddrType>
+static void UnInitHugeMem(UnInitMemAddrType unInitMemAddr)
+{
+    using UnInitHugeMemFunc = void (*)(FunctionPtr<>, bool);
+    UnInitHugeMemFunc unInitMemFunc = reinterpret_cast<UnInitHugeMemFunc>(unInitMemAddr);
+    if (unInitMemFunc) {
+        unInitMemFunc(nullptr, false);
+    }
+}
+
+template <std::string_view const& ApiName, typename... Args>
+void EXEC_NPU_CMD(Args&&... args)
+{
+    static constexpr auto workspaceSizeApiStr = GetWorkspaceSizeApiName<ApiName>();
+    static const auto getWorkspaceSizeFuncAddr = GetOpApiFuncAddr(workspaceSizeApiStr.data());
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(ApiName.data());
+    static const auto initMemAddr = GetOpApiFuncAddr("InitHugeMemThreadLocal");
+    static const auto unInitMemAddr = GetOpApiFuncAddr("UnInitHugeMemThreadLocal");
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");
+
+    ValidateApiAddresses(
+        getWorkspaceSizeFuncAddr, 
+        opApiFuncAddr, 
+        ApiName, 
+        std::string_view(workspaceSizeApiStr.data(), workspaceSizeApiStr.size())
+    );
+
+    InitHugeMem(initMemAddr);
+    uint64_t workspaceSize = 0;
+    AclOpExecutor* executor = nullptr;
+    auto convertedParams = PrepareParamsAndCalcWorkspaceSize<ApiName>(
+        &workspaceSize, 
+        &executor, 
+        getWorkspaceSizeFuncAddr,
+        std::forward<Args>(args)...
+    );
+    at::Tensor workspaceTensor;
+    void* workspaceAddr = AllocateWorkspace(workspaceSize, workspaceTensor);
+    auto aclStreamObj = c10_npu::getCurrentNPUStream().stream(false);
+
+    RunOpCommand<ApiName>(
+        aclStreamObj, workspaceAddr, workspaceSize, executor,
+        convertedParams, opApiFuncAddr, releaseMemAddr);
+
+    UnInitHugeMem(unInitMemAddr);
+}
+
+#endif // PYTORCH_NPU_HELPER_HPP_
 ```
