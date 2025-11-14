@@ -583,3 +583,373 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```shell
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+# MindIE is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#          http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
+import unittest
+import sys
+import torch
+import torch_npu
+import torch.nn as nn
+
+sys.path.append('../')
+from device import DEVICE_ID
+from mindiesd import ada_layernorm
+from mindiesd.utils import ParametersInvalid
+
+class TestAdaLayerNorm(unittest.TestCase):
+    def setUp(self):
+        self.norm_eps = 1e-5
+
+    def test_layernorm_type(self):
+        device = "npu"
+        layernorm = nn.GroupNorm(4, 64).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    def test_x_type(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = [2, 1024, 128]
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    def test_scale_type(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = [2, 128]
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    def test_shift_type(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = [2, 128]
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    def test_fused_type(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = "True"
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    def test_x_dim(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_scale_dim(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 1, 1024, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_scale_second_dim(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_shift_dim(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 1, 1024, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_shift_second_dim(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_x_scale_dim_equal(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 64], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 128], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+    def test_scale_shift_dim_equal(self):
+        device = "npu"
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+        x = torch.randn([2, 1024, 128], dtype=torch.float32).to(device)
+        scale = torch.randn([2, 128], dtype=torch.float32).to(device)
+        shift = torch.randn([2, 64], dtype=torch.float32).to(device)
+        fused = True
+
+        with self.assertRaises(ParametersInvalid):
+            ada_layernorm(layernorm, x, scale, shift, fused)
+
+
+    @torch.no_grad()
+    def test_ada_layernorm_2d_non_affine(self):
+        device = "npu"
+        batch_size = 2
+        sentence_length = 1024
+        hidden_size = 128
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+
+        x = torch.randn([batch_size, sentence_length, hidden_size], dtype=torch.float32).to(device)
+        scale = torch.randn([batch_size, hidden_size], dtype=torch.float32).to(device)
+        shift = torch.randn([batch_size, hidden_size], dtype=torch.float32).to(device)
+
+        out_fused = ada_layernorm(layernorm, x, scale, shift, fused=True)
+        out_non_fused = ada_layernorm(layernorm, x, scale, shift, fused=False)
+
+        self.assertEqual(out_non_fused.shape, out_fused.shape)
+
+        out_fused = out_fused.reshape(1, -1).to(torch.float32)
+        out_non_fused = out_non_fused.reshape(1, -1).to(torch.float32)
+        self.assertGreater(torch.cosine_similarity(out_non_fused, out_fused)[0], 2**-7)
+
+
+    @torch.no_grad()
+    def test_ada_layernorm_2d_use_affine(self):
+        device = "npu"
+        batch_size = 2
+        sentence_length = 1024
+        hidden_size = 128
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=True).to(device)
+
+        x = torch.randn([batch_size, sentence_length, hidden_size], dtype=torch.float32).to(device)
+        scale = torch.randn([batch_size, hidden_size], dtype=torch.float32).to(device)
+        shift = torch.randn([batch_size, hidden_size], dtype=torch.float32).to(device)
+
+        out_fused = ada_layernorm(layernorm, x, scale, shift, fused=True)
+        out_non_fused = ada_layernorm(layernorm, x, scale, shift, fused=False)
+
+        self.assertEqual(out_non_fused.shape, out_fused.shape)
+
+        out_fused = out_fused.reshape(1, -1).to(torch.float32)
+        out_non_fused = out_non_fused.reshape(1, -1).to(torch.float32)
+        self.assertGreater(torch.cosine_similarity(out_non_fused, out_fused)[0], 2**-7)
+
+
+    @torch.no_grad()
+    def test_ada_layernorm_3d_non_affine(self):
+        device = "npu"
+        batch_size = 2
+        sentence_length = 1024
+        hidden_size = 128
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=False).to(device)
+
+        x = torch.randn([batch_size, sentence_length, hidden_size], dtype=torch.float32).to(device)
+        scale = torch.randn([batch_size, 1, hidden_size], dtype=torch.float32).to(device)
+        shift = torch.randn([batch_size, 1, hidden_size], dtype=torch.float32).to(device)
+
+        out_fused = ada_layernorm(layernorm, x, scale, shift, fused=True)
+        out_non_fused = ada_layernorm(layernorm, x, scale, shift, fused=False)
+
+        self.assertEqual(out_non_fused.shape, out_fused.shape)
+
+        out_fused = out_fused.reshape(1, -1).to(torch.float32)
+        out_non_fused = out_non_fused.reshape(1, -1).to(torch.float32)
+        self.assertGreater(torch.cosine_similarity(out_non_fused, out_fused)[0], 2**-7)
+
+
+    @torch.no_grad()
+    def test_ada_layernorm_3d_use_affine(self):
+        device = "npu"
+        batch_size = 2
+        sentence_length = 1024
+        hidden_size = 128
+        layernorm = nn.LayerNorm(128, self.norm_eps, elementwise_affine=True).to(device)
+
+        x = torch.randn([batch_size, sentence_length, hidden_size], dtype=torch.float32).to(device)
+        scale = torch.randn([batch_size, 1, hidden_size], dtype=torch.float32).to(device)
+        shift = torch.randn([batch_size, 1, hidden_size], dtype=torch.float32).to(device)
+
+        out_fused = ada_layernorm(layernorm, x, scale, shift, fused=True)
+        out_non_fused = ada_layernorm(layernorm, x, scale, shift, fused=False)
+
+        self.assertEqual(out_non_fused.shape, out_fused.shape)
+
+        out_fused = out_fused.reshape(1, -1).to(torch.float32)
+        out_non_fused = out_non_fused.reshape(1, -1).to(torch.float32)
+        self.assertGreater(torch.cosine_similarity(out_non_fused, out_fused)[0], 2**-7)
+
+
+
+if __name__ == "__main__":
+    torch_npu.npu.set_device(DEVICE_ID)
+    unittest.main()
+
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+# MindIE is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#          http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
+import os
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import torch
+from ..utils import ParametersInvalid, file_utils
+
+current_path = Path(__file__).resolve()
+if len(current_path.parents) < 2:
+    raise ParametersInvalid("The parents level is insufficient.")
+ops_path = current_path.parents[1] / "plugin"
+ops_path = file_utils.standardize_path(str(ops_path))
+ops_file = os.path.join(ops_path, "libPTAExtensionOPS.so")
+file_utils.check_file_safety(ops_file, permission_mode=file_utils.MODELDATA_FILE_PERMISSION)
+torch.ops.load_library(ops_file)
+
+
+def check_input_params(layernorm, x, scale, shift, fused):
+    if not isinstance(layernorm, torch.nn.LayerNorm):
+        raise ParametersInvalid(f"The type of input layernorm must be torch.nn.LayerNorm, but got {type(layernorm)}.")
+    if not isinstance(x, torch.Tensor):
+        raise ParametersInvalid(f"The data type of input x must be torch.Tensor, but got {type(x)}.")
+    if not isinstance(scale, torch.Tensor):
+        raise ParametersInvalid(f"The data type of input scale must be torch.Tensor, but got {type(scale)}.")
+    if not isinstance(shift, torch.Tensor):
+        raise ParametersInvalid(f"The data type of input shift must be torch.Tensor, but got {type(shift)}.")
+    if not isinstance(fused, bool):
+        raise ParametersInvalid(f"The data type of input fused must be bool, but got {type(fused)}.")
+
+    if x.dim() != 3:    # 3: BSH输入dim
+        raise ParametersInvalid(f"The dimensional of input x must be a 3, but got {x.dim()}.")
+    if scale.dim() not in [2, 3]:    # 2: BH输入dim; 3: B1H输入dim
+        raise ParametersInvalid(f"The dimensional of input scale must be a 2 or 3, but got {scale.dim()}.")
+    if scale.dim() == 3 and scale.size()[1] != 1:
+        raise ParametersInvalid(f"If scale is a 3D tensor, the second dimension must be 1, but got {scale.size()[1]}.")
+    if shift.dim() not in [2, 3]:    # 2: BH输入dim; 3: B1H输入dim
+        raise ParametersInvalid(f"The dimensional of input shift must be a 2 or 3, but got {shift.dim()}.")
+    if shift.dim() == 3 and shift.size()[1] != 1:
+        raise ParametersInvalid(f"If shift is a 3D tensor, the second dimension must be 1, but got {shift.size()[1]}.")
+
+    last_dim_x = x.size()[-1]
+    last_dim_scale = scale.size()[-1]
+    last_dim_shift = shift.size()[-1]
+    if last_dim_x != last_dim_scale:
+        raise ParametersInvalid(f"The last dimensions of input x and input scale must be equal,  "
+                                f"but {last_dim_x} != {last_dim_scale}.")
+    if last_dim_scale != last_dim_shift:
+        raise ParametersInvalid(f"The last dimensions of input scale and input shift must be equal,  "
+                                f"but {last_dim_scale} != {last_dim_shift}.")
+
+def ada_layernorm(
+    layernorm: torch.nn.LayerNorm, 
+    x: torch.Tensor, 
+    scale: torch.Tensor, 
+    shift: torch.Tensor, 
+    fused: bool = True) -> torch.Tensor:
+    """
+    Apply AdaLayerNorm to input tensors:
+        out = layernorm(x) * (1 + scale) + shift
+
+    Args:
+        layernorm (torch.nn.LayerNorm):
+            The LayerNorm module.
+        x (torch.Tensor):
+            Tensor to apply AdaLayerNorm. x must be 3-dimensional.
+            The supported layout: [B,S,H].
+        scale (torch.Tensor):
+            Adaptive Scaling Parameters. scale must be 2 or 3-dimensional.
+            The supported layout: [B, H], [B, 1, H].
+        shift (torch.Tensor):
+            Adaptive offset parameter. shift must be 2 or 3-dimensional.
+            The supported layout: [B, H], [B, 1, H].
+        fused (bool): 
+            If fused is True, using high-performance AdaLayerNorm operator.
+
+    Returns:
+        (torch.Tensor): modified tensor with AdaLayerNorm.
+    """
+    check_input_params(layernorm, x, scale, shift, fused)
+
+    if fused:
+        if layernorm.elementwise_affine:
+            weight = layernorm.weight
+            bias = layernorm.bias
+        else:
+            weight = None
+            bias = None
+        out = torch.ops.mindie.adaln_mindie_sd(
+            x=x, scale=scale, shift=shift,
+            weight=weight, bias=bias, epsilon=layernorm.eps
+            )
+    else:
+        if scale.dim() == 2:
+            scale = scale[:, None]
+        if shift.dim() == 2:
+            shift = shift[:, None]
+        out = layernorm(x) * (1 + scale) + shift
+    return out
+```
