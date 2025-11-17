@@ -583,3 +583,443 @@ python hpsv2_score.py \
 ## 声明
 - 本代码仓提到的数据集和模型仅作为示例，这些数据集和模型仅供您用于非商业目的，如您使用这些数据集和模型来完成示例，请您特别注意应遵守对应数据集和模型的License，如您因使用数据集或模型而产生侵权纠纷，华为不承担任何责任。
 - 如您在使用本代码仓的过程中，发现任何问题（包括但不限于功能问题、合规问题），请在本代码仓提交issue，我们将及时审视并解答。
+```shell
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import os
+import sys
+import glob
+import shutil
+import argparse
+import platform
+import subprocess
+from typing import Optional
+from setuptools import setup, find_packages, Extension
+
+os.environ["SOURCE_DATE_EPOCH"] = "0"
+VERSION_ENV = "MindIESDVersion"
+VERSION_FILE_PATH = "mindiesd/version.py"
+BDIST_WHEEL_DIR = "output"
+DEFAULT_BUILD_BASE = os.path.join(BDIST_WHEEL_DIR, "build")
+DEFAULT_DIST_DIR = os.path.join(BDIST_WHEEL_DIR, "dist")
+
+def make_clean():
+    build_path = "build"
+    if os.path.exists(BDIST_WHEEL_DIR):
+        shutil.rmtree(BDIST_WHEEL_DIR)
+    for item in os.listdir(build_path):
+        item_path = os.path.join(build_path, item)
+        if os.path.isdir(item_path):
+            shutil.rmtree(item_path)
+
+def set_default_build_dirs():
+    sys.argv.insert(1, "build")
+    sys.argv.insert(2, f"--build-base={DEFAULT_BUILD_BASE}")
+    sys.argv.insert(4, f"--dist-dir={DEFAULT_DIST_DIR}")
+
+def get_mindiesd_version():
+    version = os.environ.get(VERSION_ENV, None)
+    if version:
+        print(f"The current version of mindiesd is: {version}")
+        return version
+
+    try:
+        with open(VERSION_FILE_PATH, 'r', encoding='utf-8') as f:
+            exec(compile(f.read(), VERSION_FILE_PATH, 'exec'), globals())
+        version = globals()['__version__']
+        print(f"The current version of mindiesd is: {version}")
+        return version
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"The version file '{VERSION_FILE_PATH}' doesn't exist, and version environment variable '{ENV_VERSION}' isn't set"
+        )
+    except KeyError:
+        raise KeyError(
+            f"The __version__ variable is not defined in the version file '{VERSION_FILE_PATH}'"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to read version information: {str(e)}"
+        )
+
+def get_python_tag():
+    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    return python_version
+
+def get_pytorch_version():
+    try:
+        import torch
+        torch_ver = torch.__version__.split('+')[0]
+        return f"torch{torch_ver.replace('.', '')}"
+    except Exception:
+        return "torchunknown"
+
+def get_pytorch_abi_info():
+    try:
+        import torch
+        if hasattr(torch.compiled_with_cxx11_abi, '__call__'):
+            cxx11_abi = int(torch.compiled_with_cxx11_abi())
+            return cxx11_abi
+        else:
+            return ""
+    except Exception:
+        return ""
+
+def get_platform_tag():
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+    arch_map = {
+        'x86_64': 'x86_64',
+        'aarch64': 'aarch64',
+        'arm64': 'aarch64',
+    }
+    
+    arch = arch_map.get(machine, machine)
+    return f"{system}_{arch}"
+
+def copy_so_files(src_dir, dest_dir):
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    so_files = [f for f in os.listdir(src_dir) if f.endswith('.so')]
+    if not so_files:
+        logging.warning(f"No .so files found in {src_dir}")
+        return
+    for so_file in so_files:
+        src_file = os.path.join(src_dir, so_file)
+        dest_file = os.path.join(dest_dir, so_file)
+        subprocess.check_call(['/bin/cp', src_file, dest_file])
+        logging.info(f"Copied {src_file} to {dest_file}")
+
+def copy_vendors_to_ops(src_dir, dest_dir):
+    if os.path.exists(dest_dir):
+        logging.info(f"Target directory {dest_dir} exists, deleting...")
+        shutil.rmtree(dest_dir)  
+
+    os.makedirs(dest_dir)
+    logging.info(f"Created new target directory: {dest_dir}")
+
+    if not os.path.exists(src_dir):
+        logging.warning(f"Source vendors directory not found: {src_dir}")
+        return
+
+    cmd = f'/bin/cp -r "{src_dir}"/ "{dest_dir}"/'
+    try:
+        subprocess.check_call(cmd, shell=True)
+        logging.info(f"Successfully copied all content from {src_dir} to {dest_dir}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to copy vendors directory: {e}")
+        raise  
+
+def get_requirements(req_path):
+    if not os.path.exists(req_path):
+        raise FileNotFoundError(f"requirements.txt not found at {req_path}")
+    with open(req_path, "r", encoding="utf-8") as f:
+        requirements = []
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            requirements.append(line)
+    return requirements
+
+def post_build_wheel_rename():
+    pytorch_tag = get_pytorch_version()
+    pytorch_abi = get_pytorch_abi_info()
+    platform_tag = get_platform_tag()
+    python_tag = get_python_tag()
+    
+    print(f"PyTorch version: {pytorch_tag}")
+    print(f"PyTorch ABI: {pytorch_abi}")
+    print(f"Platform: {platform_tag}")
+    print(f"Python: {python_tag}")
+    
+    wheel_files = [f for f in os.listdir(DEFAULT_DIST_DIR) if f.endswith('.whl')]
+    if len(wheel_files) == 0:
+        print(f"No wheel files found in {DEFAULT_DIST_DIR}")
+        return
+
+    original_wheel = wheel_files[0]
+    original_path = os.path.join(DEFAULT_DIST_DIR, original_wheel)
+    
+    name_version = original_wheel.split('-')
+    package_name = name_version[0]
+    version = name_version[1]
+
+    new_wheel_name = f"{package_name}-{version}+{pytorch_tag}.{pytorch_abi}-{python_tag}-none-{platform_tag}.whl"
+    new_path = os.path.join("output", new_wheel_name)
+    cmd = f'/bin/cp  "{original_path}" "{new_path}"'
+    try:
+        subprocess.check_call(cmd, shell=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to copy whl: {e}")
+        raise  
+
+def clean_bdist_wheel_artifacts(root_dir: Optional[str] = None) -> None:
+    root = root_dir if root_dir else os.getcwd()
+    if not os.path.isdir(root):
+        return 
+
+    all_artifacts = [
+        "build/build",
+        "build/vendors",
+        "*.egg-info",
+        "__pycache__",
+        "output/build",
+        "output/dist"
+    ]
+
+    to_delete = []
+    for item in all_artifacts:
+        if "*" in item:
+            matched = glob.glob(os.path.join(root, item))
+            to_delete.extend([p for p in matched if os.path.exists(p)])
+        else:
+            path = os.path.join(root, item)
+            if os.path.exists(path):
+                to_delete.append(path)
+
+    to_delete = list(set(to_delete))
+    if len(all_artifacts) == 0:
+        return
+
+    for path in to_delete:
+        print(f"To delete path - {path}")
+
+    for path in to_delete:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            elif os.path.isfile(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"Delete ({path}) failed:{str(e)}")
+            failed += 1
+
+
+if __name__ == "__main__":
+    make_clean()
+    set_default_build_dirs()
+    build_script_path = os.path.join(os.path.abspath(os.getcwd()), 'build')
+    subprocess.check_call(['bash', './build.sh'], cwd=build_script_path)
+
+    source_dir = os.path.join(build_script_path, 'build')
+    destination_dir = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'plugin')
+    copy_so_files(source_dir, destination_dir)
+    src_vendors = os.path.join(build_script_path, 'vendors')
+    dest_ops = os.path.join(os.path.abspath(os.getcwd()), 'mindiesd', 'ops')
+    copy_vendors_to_ops(src_vendors, dest_ops)
+
+    req_path = os.path.join(os.path.abspath(os.getcwd()), "requirements.txt")
+    requirements = get_requirements(req_path)
+    mindie_sd_version = get_mindiesd_version()
+
+    setup(
+        name="mindiesd",
+        version=mindie_sd_version,
+        author="ascend",
+        description="build wheel for mindie sd",
+        setup_requires=[],
+        install_requires=requirements,
+        zip_safe=False,
+        python_requires=">=3.10",
+        include_package_data=True,
+        packages=find_packages(),
+        package_data={
+            "": [
+                "*.so",  
+                "ops/**/*"
+            ]
+        },
+    )
+    post_build_wheel_rename()
+    clean_bdist_wheel_artifacts()
+
+set -e
+BUILD_DIR=$(dirname $(readlink -f $0))
+PROJ_ROOT_DIR=${BUILD_DIR}/..
+chmod a-w $BUILD_DIR/*
+
+cd ${PROJ_ROOT_DIR}
+
+PYTHON_VERSION=""
+if command -v python3 &> /dev/null; then
+    version=$(python3 --version | awk '{print$2}')
+    major=$(echo $version | cut -d '.' -f 1)
+    minor=$(echo $version | cut -d '.' -f 2)
+    PYTHON_VERSION="py${major}${minor}"
+    echo "python version is: $PYTHON_VERSION"
+else
+    echo "cannot get python version"
+    exit 1
+fi
+
+if [ -n "$PROJ_ROOT_DIR" ] && [ -d "${PROJ_ROOT_DIR}/csrc/ops" ]; then
+    source ${PROJ_ROOT_DIR}/build/build_ops.sh ${PROJ_ROOT_DIR}/build
+    SET_ENV_PATH=${PROJ_ROOT_DIR}/set_env.sh
+    touch ${SET_ENV_PATH}
+    echo "path=\${BASH_SOURCE[0]}" >> ${SET_ENV_PATH}
+    echo "SD_OPS_HOME=\$(cd \$(dirname \$path); pwd )" >> ${SET_ENV_PATH}
+    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/customize:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
+    echo "export ASCEND_CUSTOM_OPP_PATH=\${SD_OPS_HOME}/vendors/aie_ascendc:\${ASCEND_CUSTOM_OPP_PATH}" >> ${SET_ENV_PATH}
+elif [ -n "$PROJ_ROOT_DIR" ]; then
+    echo "Waring: The path of custom op operators $PROJ_ROOT_DIR/csrc/ops does not exist."
+fi
+
+if [ -n "$PROJ_ROOT_DIR" ] && [ -d "${PROJ_ROOT_DIR}/csrc/plugin" ]; then
+    source ${PROJ_ROOT_DIR}/build/build_plugin.sh ${PROJ_ROOT_DIR}/build
+elif [ -n "$PROJ_ROOT_DIR" ]; then
+    echo "Waring: The path of op plugins $PROJ_ROOT_DIR/csrc/plugin does not exist."
+fi
+
+clean_build_dirs() {
+    local dirs_to_remove=(
+        "${BUILD_DIR}/custom_project"
+        "${BUILD_DIR}/custom_project_tik"
+    )
+
+    echo "About to delete the following build-related directories: "
+    for dir in "${dirs_to_remove[@]}"; do
+        echo "  - $dir"
+    done
+    
+    for dir in "${dirs_to_remove[@]}"; do
+        if [[ -d "$dir" ]]; then
+            rm -rf "$dir"
+        else
+            echo "Directory does not exist, skipping: $dir"
+        fi
+    done
+}
+
+clean_build_dirs
+cd ${PROJ_ROOT_DIR}
+
+set -e
+
+is_ci_build="n"
+current_script_dir=$(dirname $(readlink -f $0))
+# 构建过程source该脚本需要传递实际路径，通过参数数量判断是否为构建流程
+if [ $# -ne 0 ]; then
+    is_ci_build="y"
+    current_script_dir=$(realpath $1)
+    if [ ! -f ${current_script_dir}/build_ops.sh ]; then
+        echo "${current_script_dir}/build_ops.sh not exists"
+        exit 1
+    fi
+    # 构建环境的toolkit默认安装路径
+    if [[ -d "/usr/local/Ascend" ]]; then
+        local_toolkit=/usr/local/Ascend/ascend-toolkit/latest
+    else
+        local_toolkit=/home/slave1/Ascend/ascend-toolkit/latest
+    fi
+else
+    # 对于非构建环境，推荐整包安装，通过source set_env.sh脚本会定义环境变量
+    if [ "x${ASCEND_TOOLKIT_HOME}" != "x" ]; then
+        local_toolkit=${ASCEND_TOOLKIT_HOME}
+    else
+        echo "Can not find toolkit path, please set ASCEND_TOOLKIT_HOME"
+        echo "eg: export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest"
+        exit 1
+    fi
+fi
+
+msopgen=${local_toolkit}/python/site-packages/bin/msopgen
+if [ ! -f ${msopgen} ]; then
+    echo "${msopgen} not exists"
+    exit 1
+fi
+
+function build_ops(){
+    ori_path=${PWD}
+    cd ${current_script_dir}
+    rm -rf vendors
+    source ${current_script_dir}/build_ascendc_ops.sh
+    source ${current_script_dir}/build_tik_ops.sh
+    rm -rf ${current_script_dir}/vendors/aie_ascendc/bin
+    rm -rf ${current_script_dir}/vendors/customize/bin
+    rm -rf ${current_script_dir}/vendors/aie_ascendc/op_api
+    cd ${ori_path}
+}
+
+build_ops
+
+set -e
+
+if [ -n "$ASCEND_INSTALL_PATH" ]; then
+    _ASCEND_INSTALL_PATH=$ASCEND_INSTALL_PATH
+elif [ -n "$ASCEND_HOME_PATH" ]; then
+    _ASCEND_INSTALL_PATH=$ASCEND_HOME_PATH
+else
+    if [ -d "$HOME/Ascend/ascend-toolkit/latest" ]; then
+        _ASCEND_INSTALL_PATH=$HOME/Ascend/ascend-toolkit/latest
+    else
+        _ASCEND_INSTALL_PATH=/usr/local/Ascend/ascend-toolkit/latest
+    fi
+fi
+
+set +e
+source $_ASCEND_INSTALL_PATH/bin/setenv.bash
+set -e
+
+rm -rf build
+mkdir -p build
+cmake -B build ../csrc
+cmake --build build -j
+
+copy_so_files() {
+    if [ $# -ne 2 ]; then
+        echo "Error: Please pass two arguments (source directory and target directory)"
+        return 1
+    fi
+
+    local src_dir="$1"
+    local dest_dir="$2"
+
+    if [ ! -d "$src_dir" ]; then
+        echo "Error: Source directory $src_dir does not exist or is not a valid directory"
+        return 1
+    fi
+
+    if [ ! -d "$dest_dir" ]; then
+        echo "Target directory '$dest_dir' does not exist, creating now..."
+        mkdir -p "$dest_dir" || {
+            echo "Error: Failed to create target directory $dest_dir"
+            return 1
+        }
+    fi
+
+    echo "Searching for .so files in $src_dir..."
+    local so_files=$(find "$src_dir" -type f -name "*.so" 2>/dev/null)
+
+    if [ -z "$so_files" ]; then
+        echo "Notice: No .so files found in source directory $src_dir"
+        return 0
+    fi
+
+    find "$src_dir" -type f -name "*.so" -exec cp {} "$dest_dir" \; 2>/dev/null
+
+    local count=$(echo "$so_files" | wc -l)
+    echo "Successfully copied $count .so files to $dest_dir"
+    return 0
+}
+
+BUILD_DIR=$(dirname $(readlink -f $0))
+SRC_DIR=${BUILD_DIR}/build
+DSET_DIR=${BUILD_DIR}/../mindiesd/plugin
+copy_so_files $SRC_DIR $DSET_DIR
+```
