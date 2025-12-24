@@ -14,6 +14,7 @@
 
 
 from typing import Any, Dict, List, Optional, Union
+import os
 import numpy as np
 
 import torch
@@ -26,22 +27,38 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models.activations import GEGLU, ApproximateGELU, SwiGLU, LinearActivation
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.attention_processor import AttentionProcessor
 
+import mindiesd
+
 from .modeling_utils import ModelMixin
 from ..layers import FluxPosEmbed
+from ..layers import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from ..utils import get_local_rank, get_world_size
 from ..layers import Attention, GELU
 from ..layers import FluxAttnProcessor2_0, FluxSingleAttnProcessor2_0
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+
+current_stream = None
+stream2 = None
+current_event = None
+event2 = None
+
+def init_double_stream():
+    global current_stream
+    global stream2
+    global current_event
+    global event2
+    current_stream = torch.npu.current_stream()
+    stream2 = torch.npu.Stream()
+    current_event = torch.npu.Event()
+    event2 = torch.npu.Event()
 
 # YiYi to-do: refactor rope related functions/classes
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -120,6 +137,14 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,
             is_tp=is_tp,
         )
+        self.comm_async = bool(int(os.environ.get("COMM_OVERLAP", 0)))
+        if self.comm_async:
+            try:
+                world_size = dist.get_world_size()
+                if world_size < 2:
+                    self.comm_async = False
+            except:
+                self.comm_async = False
 
     def forward(
         self,
@@ -127,19 +152,38 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.FloatTensor,
         image_rotary_emb=None,
     ):
-        residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
-        if self.is_tp:
-            B, S, H = mlp_hidden_states.shape
-            mlp_hidden_states_full = torch.empty([get_world_size(), B, S, H], dtype=mlp_hidden_states.dtype, device=mlp_hidden_states.device)
-            dist.all_gather_into_tensor(mlp_hidden_states_full, mlp_hidden_states)
-            mlp_hidden_states = mlp_hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
+        if self.comm_async:
+            residual = hidden_states
+            norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+            attn_output_work, attn_output_func = self.attn(
+                hidden_states=norm_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+            )
+            mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+            attn_output_work.wait()
+            attn_output = attn_output_func()
+            
+            mlp_hidden_states = self.act_mlp(mlp_hidden_states)
+            if self.is_tp:
+                B, S, H = mlp_hidden_states.shape
+                mlp_hidden_states_full = torch.empty([get_world_size(), B, S, H], dtype=mlp_hidden_states.dtype, device=mlp_hidden_states.device)
+                dist.all_gather_into_tensor(mlp_hidden_states_full, mlp_hidden_states)
+                mlp_hidden_states = mlp_hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
+            
+        else:
+            residual = hidden_states
+            norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+            if self.is_tp:
+                B, S, H = mlp_hidden_states.shape
+                mlp_hidden_states_full = torch.empty([get_world_size(), B, S, H], dtype=mlp_hidden_states.dtype, device=mlp_hidden_states.device)
+                dist.all_gather_into_tensor(mlp_hidden_states_full, mlp_hidden_states)
+                mlp_hidden_states = mlp_hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
 
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-        )
+            attn_output = self.attn(
+                hidden_states=norm_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+            )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
@@ -216,7 +260,35 @@ class FluxTransformerBlock(nn.Module):
 
         self.is_tp = is_tp
 
+        self.adalayernorm_fused = bool(int(os.environ.get("ADALN_FUSE", 0)))
+        self.double_stream = bool(int(os.environ.get("DOUBLE_STREAM", 0)))
+
     def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor,
+        temb: torch.FloatTensor,
+        image_rotary_emb=None,
+        is_tp: bool = False,
+    ):
+        if self.double_stream:
+            return self.double_stream_forward(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                image_rotary_emb,
+                is_tp
+            )
+        else:
+            return self.original_forward(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                image_rotary_emb,
+                is_tp
+            )
+
+    def original_forward(
         self,
         hidden_states: torch.FloatTensor,
         encoder_hidden_states: torch.FloatTensor,
@@ -241,8 +313,11 @@ class FluxTransformerBlock(nn.Module):
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if self.adalayernorm_fused:
+            norm_hidden_states = mindiesd.layernorm_scale_shift(self.norm2, hidden_states, scale_mlp[:, None], shift_mlp[:, None], fused=True)
+        else:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
         ff_output = self.ff(norm_hidden_states)
         if self.is_tp:
@@ -256,8 +331,94 @@ class FluxTransformerBlock(nn.Module):
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        if self.adalayernorm_fused:
+            norm_encoder_hidden_states = mindiesd.layernorm_scale_shift(self.norm2_context, encoder_hidden_states, c_scale_mlp[:, None], c_shift_mlp[:, None], fused=True)
+        else:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+
+
+        context_ff_output = self.ff_context(norm_encoder_hidden_states)
+        if self.is_tp:
+            dist.all_reduce(context_ff_output, op=dist.ReduceOp.SUM)
+        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+
+        return hidden_states, encoder_hidden_states
+
+    def double_stream_forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor,
+        temb: torch.FloatTensor,
+        image_rotary_emb=None,
+        is_tp: bool = False,
+    ):
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+            encoder_hidden_states, emb=temb
+        )
+
+        emb = self.norm1.linear(self.norm1.silu(temb))
+        current_event.record(current_stream)
+
+        with torch.npu.stream(stream2):
+            stream2.wait_event(current_event)
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=emb, skip_matmul=True)
+            event2.record(stream2)
+
+        pre_encoder_query = self.attn.add_q_proj(norm_encoder_hidden_states)
+        pre_encoder_key = self.attn.add_k_proj(norm_encoder_hidden_states)
+        pre_encoder_value = self.attn.add_v_proj(norm_encoder_hidden_states)
+        current_stream.wait_event(event2)
+        # Attention.
+        attention_outputs = self.attn(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            pre_encoder_query=pre_encoder_query,
+            pre_encoder_key=pre_encoder_key,
+            pre_encoder_value=pre_encoder_value,
+            cal_encoder_qkv=False,
+        )
+        if len(attention_outputs) == 2:
+            attn_output, context_attn_output = attention_outputs
+        elif len(attention_outputs) == 3:
+            attn_output, context_attn_output, ip_attn_output = attention_outputs
+        # Process attention outputs for the `hidden_states`.
+        attn_output = gate_msa.unsqueeze(1) * attn_output
+        hidden_states = hidden_states + attn_output
+
+        if self.adalayernorm_fused:
+            norm_hidden_states = mindiesd.layernorm_scale_shift(self.norm2, hidden_states, scale_mlp[:, None], shift_mlp[:, None], fused=True)
+        else:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+
+        current_event.record(current_stream)
+        with torch.npu.stream(stream2):
+            stream2.wait_event(current_event)
+            # Process attention outputs for the `encoder_hidden_states`.
+
+            context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
+            encoder_hidden_states = encoder_hidden_states + context_attn_output
+
+            if self.adalayernorm_fused:
+                norm_encoder_hidden_states = mindiesd.layernorm_scale_shift(self.norm2_context, encoder_hidden_states, c_scale_mlp[:, None], c_shift_mlp[:, None], fused=True)
+            else:
+                norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+                norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+            event2.record(stream2)
+
+        ff_output = self.ff(norm_hidden_states)
+        current_stream.wait_event(event2)
+
+        if self.is_tp:
+            dist.all_reduce(ff_output, op=dist.ReduceOp.SUM)
+        ff_output = gate_mlp.unsqueeze(1) * ff_output
+
+        hidden_states = hidden_states + ff_output
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         if self.is_tp:
@@ -348,9 +509,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
 
         self.gradient_checkpointing = False
 
-
     @property
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
         Returns:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2025 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,132 +21,22 @@ import time
 
 import torch
 import torch_npu
-
 from torch_npu.contrib import transfer_to_npu
+from transformers import T5EncoderModel
 
 from mindiesd import CacheAgent, CacheConfig
+
 from FLUX1dev import BlockOffloadHookV2
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
+from FLUX1dev.models import init_double_stream
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
-from transformers import T5EncoderModel
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
-
-
-class PromptLoader:
-    def __init__(
-            self,
-            prompt_file: str,
-            prompt_file_type: str,
-            batch_size: int = 1,
-            num_images_per_prompt: int = 1,
-            max_num_prompts: int = 0
-    ):
-        self.check_input_isvalid(batch_size, num_images_per_prompt, max_num_prompts)
-        self.prompts = []
-        self.catagories = ['Not_specified']
-        self.batch_size = batch_size
-        self.num_images_per_prompt = num_images_per_prompt
-
-        if prompt_file_type == 'plain':
-            self.load_prompts_plain(prompt_file, max_num_prompts)
-        elif prompt_file_type == 'parti':
-            self.load_prompts_parti(prompt_file, max_num_prompts)
-        elif prompt_file_type == 'hpsv2':
-            self.load_prompts_hpsv2(max_num_prompts)
-        else:
-            print("This operation is not supported!")
-
-        self.current_id = 0
-        self.inner_id = 0
-
-    def __len__(self):
-        return len(self.prompts) * self.num_images_per_prompt
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.current_id == len(self.prompts):
-            raise StopIteration
-        
-        ret = {
-            'prompts': [],
-            'catagories': [],
-            'save_names': [],
-            'n_prompts': self.batch_size,
-        }
-        for _ in range(self.batch_size):
-            if self.current_id == len(self.prompts):
-                ret['prompts'].append('')
-                ret['save_names'].append('')
-                ret['catagories'].append('')
-                ret['n_prompts'] -= 1
-
-            else:
-                prompt, catagory_id = self.prompts[self.current_id]
-                ret['prompts'].append(prompt)
-                ret['catagories'].append(self.catagories[catagory_id])
-                ret['save_names'].append(f'{self.current_id}_{self.inner_id}')
-
-                self.inner_id += 1
-                if self.inner_id == self.num_images_per_prompt:
-                    self.inner_id = 0
-                    self.current_id += 1
-
-        return ret
-    
-    def load_prompts_plain(self, file_path: str, max_num_prompts: int):
-        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
-            for i, line in enumerate(f):
-                if max_num_prompts and i == max_num_prompts:
-                    break
-
-                prompt = line.strip()
-                self.prompts.append((prompt, 0))
-
-    def load_prompts_parti(self, file_path: str, max_num_prompts: int):
-        with os.fdopen(os.open(file_path, os.O_RDONLY), "r") as f:
-            # Skip the first line
-            next(f)
-            tsv_file = csv.reader(f, delimiter="\t")
-            for i, line in enumerate(tsv_file):
-                if max_num_prompts and i == max_num_prompts:
-                    break
-
-                prompt = line[0]
-                catagory = line[1]
-                if catagory not in self.catagories:
-                    self.catagories.append(catagory)
-
-                catagory_id = self.catagories.index(catagory)
-                self.prompts.append((prompt, catagory_id))
-
-    def load_prompts_hpsv2(self, max_num_prompts: int):
-        with open('hpsv2_benchmark_prompts.json', 'r') as file:
-            all_prompts = json.load(file)
-        count = 0
-        for style, prompts in all_prompts.items():
-            for prompt in prompts:
-                count += 1
-                if max_num_prompts and count >= max_num_prompts:
-                    break
-
-                if style not in self.catagories:
-                    self.catagories.append(style)
-
-                catagory_id = self.catagories.index(style)
-                self.prompts.append((prompt, catagory_id))
-
-    def check_input_isvalid(self, batch_size, num_images_per_prompt, max_num_prompts):
-        if batch_size <= 0:
-            raise ValueError(f"Param batch_size invalid, expected positive value, but get {batch_size}")
-        if num_images_per_prompt <= 0:
-            raise ValueError(f"Param num_images_per_prompt invalid, expected positive value, but get {num_images_per_prompt}")
-        if max_num_prompts < 0:
-            raise ValueError(f"Param max_num_prompts invalid, expected greater than or equal to 0, \
-                                 but get {max_num_prompts}")
+if bool(os.environ.get("USE_NZ", 0)):
+    torch.npu.config.allow_internal_format=True
+else:
+    torch.npu.config.allow_internal_format=False
 
 
 def parse_arguments():
@@ -166,7 +56,8 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42, help="A seed for all the prompts")
     parser.add_argument("--use_cache", action="store_true", help="turn on dit cache or not")
     parser.add_argument("--batch_size", type=int, default=1, help="prompt batch size")
-    parser.add_argument("--device_type", choices=["A2-32g", "A2-64g"], default="A2-64g", help="specify device type")
+    # ======================== Cpu offload config ========================
+    parser.add_argument("--cpu_offload", action="store_true", help="when use 32g device, turn on cpu offload.")
     # ======================== Parallel config ========================
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -182,15 +73,44 @@ def parse_arguments():
     # ======================== Quant config ========================
     parser.add_argument("--use_quant", action="store_true", help="turn on quant or not")
     parser.add_argument("--quant_type", choices=["w8a16", "w8a8_dynamic"], default="w8a8_dynamic", help="specify quant type")
+    # ======================== Test config ========================
+    parser.add_argument("--prompt", type=str, default="Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper", help="default prompt")
     return parser.parse_args()
 
 
+def _transpose_to_nz(model):
+    torch.npu.config.allow_internal_format=True
+    if not hasattr(model, "named_modules"):
+        return
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            if module.weight.data.device.type == "cpu":
+                module.weight.data = module.weight.data.to("npu")
+            try:
+                weight = torch_npu.npu_format_cast(module.weight.data.contiguous(), 29)
+                module.weight.data = weight
+            except Exception as e:
+                logger.warning(f"Failed to transpose {name} to NZ, skipping: {e}")
+
+
+def transfer_nd_to_nz(pipe):
+    for attr in dir(pipe):
+        if attr.startswith("_") or not hasattr(pipe, attr):
+            continue
+        if hasattr(getattr(pipe, attr), "named_modules"):
+            _transpose_to_nz(getattr(pipe, attr))
+
+
 def initialize_pipeline(args):
+    if bool(int(os.environ.get("FAST_GELU", 0))):
+        from FLUX1dev.layers import enable_fast_gelu
+        enable_fast_gelu()
+
     if args.tensor_parallel or args.sequence_parallel:
         local_rank = get_local_rank()
         world_size = get_world_size()
-        if world_size != 2:
-            raise ValueError(f"number of NPUs should be equal to 2.")
+        if args.tensor_parallel and world_size != 2:
+            raise ValueError(f"When enable tensor parallel, number of NPUs should be equal to 2.")
         initialize_torch_distributed(local_rank, world_size)
         device = torch.device(f"npu:{local_rank}")
     else:
@@ -207,7 +127,7 @@ def initialize_pipeline(args):
         FluxPipeline.extract_init_dict = classmethod(replace_tp_extract_init_dict)
 
     pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
-    pipe.transformer.pos_embed.enable_cache(steps_count=args.infer_steps)
+    
     if args.sequence_parallel:
         pipe.transformer.pos_embed.enable_seq_parallel()
         
@@ -258,7 +178,6 @@ def initialize_pipeline(args):
         s_stream_agent = CacheAgent(s_stream_config)
         pipe.transformer.s_stream_agent = s_stream_agent
 
-    
     if args.tensor_parallel:
         import deepspeed
         T5_model = deepspeed.init_inference(
@@ -269,7 +188,6 @@ def initialize_pipeline(args):
         pipe.to(f"npu:{local_rank}")
         pipe.text_encoder_2.to("cpu")
         pipe.text_encoder_2 = T5_model.module.to(f"npu:{local_rank}")
-
     else:
         if args.sequence_parallel:
             parallel_args = {
@@ -281,16 +199,15 @@ def initialize_pipeline(args):
             }
             pipe = parallelize_transformer(pipe, parallel_args)
 
-        if args.device_type == "A2-64g":
+        if args.use_quant:
+            from mindiesd import quantize
+            quant_config_path = os.path.join(args.path, f"quant_weights_{args.quant_type}/quant_model_description_{args.quant_type}.json")
+            pipe.transformer = quantize(pipe.transformer, quant_config_path, timestep_config=None, dtype=torch.bfloat16)
             pipe.to(device)
         else:
-            if args.use_quant:
-                from mindiesd import quantize
-                quant_config_path = os.path.join(args.path, f"quant_weights_{args.quant_type}/quant_model_description_{args.quant_type}.json")
-                pipe.transformer = quantize(pipe.transformer, quant_config_path, timestep_config=None, dtype=torch.bfloat16)
+            if not args.cpu_offload:
                 pipe.to(device)
             else:
-                # pipe.enable_model_cpu_offload()
                 original_transformer = pipe.transformer
                 pipe.transformer = None
                 pipe.to(device)
@@ -315,44 +232,36 @@ def initialize_pipeline(args):
                 for name, module in pipe.transformer.named_children():
                     if name not in ["transformer_blocks", "single_transformer_blocks"]:
                         module.to(device) 
+
+    if bool(os.environ.get("USE_NZ", 0)):
+        transfer_nd_to_nz(pipe)
+
+    if bool(int(os.environ.get("DOUBLE_STREAM", 0))):
+        init_double_stream()
     return pipe
 
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.npu.manual_seed(seed)
+    torch.npu.manual_seed_all(seed)
 def infer(args):
-    torch.manual_seed(args.seed)
-    torch.npu.manual_seed(args.seed)
-    torch.npu.manual_seed_all(args.seed)
+    set_seed(args.seed)
 
     pipe = initialize_pipeline(args)
 
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path, mode=0o640)
     check_dir_safety(args.save_path)
-
-    infer_num = 0
-    time_consume = 0
-    current_prompt = None
-    image_info = []
-    check_file_safety(args.prompt_path)
-    prompt_loader = PromptLoader(args.prompt_path,
-                                args.prompt_type,
-                                args.batch_size,
-                                args.num_images_per_prompt,
-                                args.max_num_prompt)
     check_param_valid(args.height, args.width, args.infer_steps)
-    for _, input_info in enumerate(prompt_loader):
-        prompts = input_info['prompts']
-        catagories = input_info['catagories']
-        save_names = input_info['save_names']
-        n_prompts = input_info['n_prompts']
-
-        check_prompts_valid(prompts)
-
-        print(f"[{infer_num+n_prompts}/{len(prompt_loader)}]: {prompts}")
-        infer_num += args.batch_size
-        if infer_num > 3:
-            torch.npu.synchronize()
-            start_time = time.time()
-
+    
+    total_nums = 6
+    warmup_nums = 3
+    time_consume = 0.0
+    
+    for i in range(total_nums):
+        prompts = [args.prompt]
+        torch.npu.synchronize()
+        start_time = time.time()
         image = pipe(
             prompts,
             height=args.width,
@@ -361,39 +270,23 @@ def infer(args):
             num_inference_steps=args.infer_steps,
             max_sequence_length=512,
             use_cache=args.use_cache,
-        )
+        )        
+        torch.npu.synchronize()
+        end_time = time.time() - start_time
+        print(f"The inference time of the {i} image is: {end_time}")
 
-        if infer_num > 3:
-            torch.npu.synchronize()
-            end_time = time.time() - start_time
+        if i > (warmup_nums - 1):
             time_consume += end_time
 
-        for j in range(n_prompts):
-            image_save_path = os.path.join(args.save_path, f"{save_names[j]}.png")
-            image[0][j].save(image_save_path)
-
-            if current_prompt != prompts[j]:
-                current_prompt = prompts[j]
-                image_info.append({'images': [], 'prompt': current_prompt, 'category': catagories[j]})
-
-            image_info[-1]['images'].append(image_save_path)
-    
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            if os.path.exists(args.info_file_save_path):
-                os.remove(args.info_file_save_path)
-
-            with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
-                json.dump(image_info, f)
-    else:
-        if os.path.exists(args.info_file_save_path):
-            os.remove(args.info_file_save_path)
-
-        with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
-            json.dump(image_info, f)
-
-    image_time_count = len(prompt_loader) - 3
-    print(f"flux pipeline time is:{time_consume/image_time_count}")
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                image_save_path = os.path.join(args.save_path, f"{i}.png")
+                image[0][0].save(image_save_path)
+        else:
+            image_save_path = os.path.join(args.save_path, f"{i}.png")
+            image[0][0].save(image_save_path)
+        
+    print(f"Average inference time is: {time_consume / (total_nums - warmup_nums)}")
 
     return
 

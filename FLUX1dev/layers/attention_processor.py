@@ -14,6 +14,7 @@
 from typing import Optional
 import inspect
 
+import os
 import torch
 import torch_npu
 import torch.nn.functional as F
@@ -25,29 +26,24 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.utils import logging
 from mindiesd import attention_forward
 from mindiesd import rotary_position_embedding
+from .embedding import apply_rotary_emb, apply_rotary_emb_mindiesd
 from ..utils import get_local_rank, get_world_size
 
 logger = logging.get_logger(__name__)
 
-
-def apply_rotary_emb_mindiesd(x, freqs_cis):
-    cos, sin = freqs_cis
-    cos = cos.reshape(1, cos.shape[0], 1, cos.shape[-1])
-    sin = sin.reshape(1, sin.shape[0], 1, sin.shape[-1])
-    cos, sin = cos.to(x.device), sin.to(x.device)
-
-    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
-
-
-def apply_fa(query, key, value, attention_mask):
+def apply_fa(query, key, value, attention_mask, use_la=False):
     batch_size = query.shape[0]
     heads = query.shape[-2]
     head_dim = query.shape[-1]
     
-    hidden_states = attention_forward(query, key, value, opt_mode="manual", attn_mask=attention_mask, 
-                                      op_type="fused_attn_score", layout="BSND")
-    return hidden_states.reshape(batch_size, -1, head_dim * heads)
-
+    if use_la:
+        hidden_states = attention_forward(query, key, value, opt_mode="manual", 
+                                            op_type="ascend_laser_attention", layout="BNSD")
+    else:
+        hidden_states = attention_forward(query, key, value, opt_mode="manual", attn_mask=attention_mask, 
+                                        op_type="fused_attn_score", layout="BSND")
+    output = hidden_states.reshape(batch_size, -1, head_dim * heads)
+    return output
 
 
 @maybe_allow_in_graph
@@ -335,6 +331,10 @@ class FluxSingleAttnProcessor2_0:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
+        self.use_la = bool(int(os.environ.get("ENABLE_LA", 0)))
+        self.use_fuse_rope = bool(int(os.environ.get("ROPE_FUSE", 0)))
+        self.use_fuse_rmsnorm = bool(int(os.environ.get("RMSNORM_FUSE", 0)))
+
     def __call__(
         self,
         attn: Attention,
@@ -371,17 +371,21 @@ class FluxSingleAttnProcessor2_0:
         value = value.view(batch_size, -1, attn_heads, head_dim)
 
         if attn.norm_q is not None:
-            query = attn.norm_q(query)
+            query = attn.norm_q(query, if_fused=self.use_fuse_rmsnorm)
         if attn.norm_k is not None:
-            key = attn.norm_k(key)
+            key = attn.norm_k(key, if_fused=self.use_fuse_rmsnorm)
 
         # Apply RoPE if needed
         if image_rotary_emb is not None:
-            query = apply_rotary_emb_mindiesd(query, image_rotary_emb)
-            key = apply_rotary_emb_mindiesd(key, image_rotary_emb)
+            if self.use_fuse_rope:
+                query = apply_rotary_emb_mindiesd(query, image_rotary_emb, layout="BSND")
+                key = apply_rotary_emb_mindiesd(key, image_rotary_emb, layout="BSND")
+            else:
+                query = apply_rotary_emb(query, image_rotary_emb, layout="BSND")
+                key = apply_rotary_emb(key, image_rotary_emb, layout="BSND")
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        hidden_states = apply_fa(query, key, value, attention_mask)
+        hidden_states = apply_fa(query, key, value, attention_mask, use_la=self.use_la)
         hidden_states = hidden_states.to(query.dtype)
         B, S, H = hidden_states.shape
         if attn.is_tp:
@@ -401,6 +405,8 @@ class FluxAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self.use_fuse_rope = bool(int(os.environ.get("ROPE_FUSE", 0)))
+        self.use_fuse_rmsnorm = bool(int(os.environ.get("RMSNORM_FUSE", 0)))
 
     def __call__(
         self,
@@ -409,6 +415,10 @@ class FluxAttnProcessor2_0:
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        pre_encoder_query: Optional[torch.Tensor] = None,
+        pre_encoder_key: Optional[torch.Tensor] = None,
+        pre_encoder_value: Optional[torch.Tensor] = None,
+        cal_encoder_qkv: bool=True
     ) -> torch.FloatTensor:
         input_ndim = hidden_states.ndim
         if input_ndim == 4:
@@ -438,14 +448,20 @@ class FluxAttnProcessor2_0:
         value = value.view(batch_size, -1, attn_heads, head_dim)
 
         if attn.norm_q is not None:
-            query = attn.norm_q(query)
+            query = attn.norm_q(query, if_fused=self.use_fuse_rmsnorm)
         if attn.norm_k is not None:
-            key = attn.norm_k(key)
+            key = attn.norm_k(key, if_fused=self.use_fuse_rmsnorm)
 
         # `context` projections.
-        encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-        encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-        encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+        if cal_encoder_qkv:
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+        else:
+            encoder_hidden_states_query_proj = pre_encoder_query
+            encoder_hidden_states_key_proj = pre_encoder_key
+            encoder_hidden_states_value_proj = pre_encoder_value
+
 
         encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
             batch_size, -1, attn_heads, head_dim
@@ -458,9 +474,9 @@ class FluxAttnProcessor2_0:
         )
 
         if attn.norm_added_q is not None:
-            encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
+            encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj, if_fused=self.use_fuse_rmsnorm)
         if attn.norm_added_k is not None:
-            encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
+            encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj, if_fused=self.use_fuse_rmsnorm)
 
         # attention
         query = torch.cat([encoder_hidden_states_query_proj, query], dim=1)
@@ -468,11 +484,15 @@ class FluxAttnProcessor2_0:
         value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb_mindiesd(query, image_rotary_emb)
-            key = apply_rotary_emb_mindiesd(key, image_rotary_emb)
+            if self.use_fuse_rope:
+                query = apply_rotary_emb_mindiesd(query, image_rotary_emb, layout="BSND")
+                key = apply_rotary_emb_mindiesd(key, image_rotary_emb, layout="BSND")
+            else:
+                query = apply_rotary_emb(query, image_rotary_emb, layout="BSND")
+                key = apply_rotary_emb(key, image_rotary_emb, layout="BSND")
 
         
-        hidden_states = apply_fa(query, key, value, attention_mask)
+        hidden_states = apply_fa(query, key, value, attention_mask, use_la=self.use_la)
         hidden_states = hidden_states.to(query.dtype)
 
         encoder_hidden_states, hidden_states = (

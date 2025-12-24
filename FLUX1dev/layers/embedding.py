@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union, List
+from typing import Union, List, Tuple
 import numpy as np
 
+import os
 import torch
 from torch import nn
 import torch_npu
 
+from mindiesd import rotary_position_embedding
 
 class FluxPosEmbed(nn.Module):
     # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
@@ -29,11 +31,11 @@ class FluxPosEmbed(nn.Module):
         self.use_cache = False
         self.seq_parallel = False
 
-    def enable_cache(self, steps_count):
-        self.use_cache = True
-        self.cache = None
-        self._cur_step = 0
-        self.steps_count = steps_count
+        self.use_cache = bool(int(os.environ.get('POSEMB_CACHE', 0)))
+        if self.use_cache:
+            self.steps_count = int(os.environ.get('INFER_STEPS', 50))
+            self.cache = None
+            self._cur_step = 0
 
     def enable_seq_parallel(self, group=None):
         import torch.distributed as dist
@@ -151,3 +153,72 @@ def get_1d_rotary_pos_embed(
         # lumina
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64     # [S, D/2]
         return freqs_cis
+
+
+def apply_rotary_emb(
+    x: torch.Tensor,
+    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]],
+    use_real: bool = True,
+    use_real_unbind_dim: int = -1,
+    layout="BNSD"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor. This function applies rotary embeddings
+    to the given query or key 'x' tensors using the provided frequency tensor 'freqs_cis'. The input tensors are
+    reshaped as complex numbers, and the frequency tensor is reshaped for broadcasting compatibility. The resulting
+    tensors contain rotary embeddings and are returned as real tensors.
+
+    Args:
+        x (`torch.Tensor`):
+            Query or key tensor to apply rotary embeddings. [B, H, S, D] xk (torch.Tensor): Key tensor to apply
+        freqs_cis (`Tuple[torch.Tensor]`): Precomputed frequency tensor for complex exponentials. ([S, D], [S, D],)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    """
+    if use_real:
+        cos, sin = freqs_cis  # [S, D]
+        if layout == "BNSD":
+            cos = cos[None, None, :, :]
+            sin = sin[None, None, :, :]
+        else:
+            cos = cos[None, :, None, :]
+            sin = sin[None, :, None, :]
+        cos, sin = cos.to(x.device), sin.to(x.device)
+    
+        if use_real_unbind_dim == -1:
+            # Used for flux, cogvideox, hunyuan-dit
+            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
+            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+        elif use_real_unbind_dim == -2:
+            # Used for Stable Audio
+            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)  # [B, S, H, D//2]
+            x_rotated = torch.cat([-x_imag, x_real], dim=-1)
+        else:
+            raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
+
+        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+        return out
+    else:
+        # used for lumina
+        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        freqs_cis = freqs_cis.unsqueeze(2)
+        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+
+        return x_out.type_as(x)
+
+
+def apply_rotary_emb_mindiesd(x, freqs_cis, layout="BNSD"):
+    cos, sin = freqs_cis
+    if layout == "BNSD":
+        cos = cos.reshape(1, 1, cos.shape[0], cos.shape[1])
+        sin = sin.reshape(1, 1, sin.shape[0], sin.shape[1])
+        cos, sin = cos.to(x.device), sin.to(x.device)
+        output = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=True, fused=True)
+    else:
+        cos = cos.reshape(1, cos.shape[0], 1, cos.shape[-1])
+        sin = sin.reshape(1, sin.shape[0], 1, sin.shape[-1])
+        cos, sin = cos.to(x.device), sin.to(x.device)
+        output = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+    return output

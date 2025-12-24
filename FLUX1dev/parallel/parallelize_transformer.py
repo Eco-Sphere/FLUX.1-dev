@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import inspect
 import functools
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -34,7 +35,6 @@ from diffusers.models import AutoencoderKL, FluxTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     USE_PEFT_BACKEND,
-    is_torch_xla_available,
     logging,
     replace_example_docstring,
     scale_lora_layers,
@@ -46,17 +46,9 @@ from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from ..pipeline import FluxPipeline
-from .parallelize_attention import FluxAttnProcessor2_0
+from .parallelize_attention import FluxAttnProcessor2_0, FluxSingleAttnProcessor2_0, FluxAttnProcessor2_0_TxtNonSplit
 from .sequence_length_tracker import set_global_seq, set_split_seq
 from .comm import split, gather
-
-
-if is_torch_xla_available():
-    import torch_xla.core.xla_model as xm
-
-    XLA_AVAILABLE = True
-else:
-    XLA_AVAILABLE = False
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -150,6 +142,7 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
+
 class FluxPipelineWrapper(FluxPipeline):
     model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
     _optional_components = []
@@ -179,7 +172,7 @@ class FluxPipelineWrapper(FluxPipeline):
         self.ulysses_group = parallel_args["ulysses"]["group"]
         self.ulysses_world_size = parallel_args["ulysses"]["world_size"]
         self.ulysses_rank = parallel_args["ulysses"]["rank"]
-
+        self.txt_split = bool(int(os.environ.get("TXT_SPLIT", 1)))
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -366,9 +359,10 @@ class FluxPipelineWrapper(FluxPipeline):
         set_split_seq(tensor_name="img", world_size=self.ulysses_world_size)
         set_split_seq(tensor_name="all", world_size=self.ulysses_world_size)
 
+
         latents = split(latents, self.ulysses_world_size, self.ulysses_rank, dim=1)
-        #TODO 不切分txt的话需要注释掉
-        prompt_embeds = split(prompt_embeds, self.ulysses_world_size, self.ulysses_rank, dim=1)
+        if self.txt_split:
+            prompt_embeds = split(prompt_embeds, self.ulysses_world_size, self.ulysses_rank, dim=1)
 
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -422,9 +416,6 @@ class FluxPipelineWrapper(FluxPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
 
         latents = gather(latents, self.ulysses_group, self.ulysses_world_size) 
 
@@ -552,12 +543,11 @@ def parallelize_transformer(pipe, parallel_args):
                     image_rotary_emb=image_rotary_emb,
                 )
 
-        # #TODO 不切分txt
-        # rank = torch.distributed.get_rank()
-        # world_size = torch.distributed.get_world_size()
-        # encoder_hidden_states = encoder_hidden_states.chunk(world_size, dim=1)[rank]
-
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        if self.txt_split:
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        else:
+            encoder_hidden_states = encoder_hidden_states.chunk(self.ulysses_world_size, dim=1)[self.ulysses_rank]
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         for _, block in enumerate(self.single_transformer_blocks):
             if use_cache:
@@ -591,5 +581,28 @@ def parallelize_transformer(pipe, parallel_args):
     new_forward = new_forward.__get__(transformer)
     transformer.forward = new_forward
 
-    transformer.set_attn_processor(FluxAttnProcessor2_0(parallel_args))
+    transformer.ulysses_group = parallel_args["ulysses"]["group"]
+    transformer.ulysses_world_size = parallel_args["ulysses"]["world_size"]
+    transformer.ulysses_rank = parallel_args["ulysses"]["rank"]
+    transformer.txt_split = bool(int(os.environ.get("TXT_SPLIT", 1)))
+
+    txt_split = bool(int(os.environ.get("TXT_SPLIT", 0)))
+    # transformer.set_attn_processor(FluxAttnProcessor2_0(parallel_args))
+    def set_parallel_attn_processor(model):
+        def fn_recursive_attn_processor(name: str, module: torch.nn.Module):
+            if hasattr(module, "set_processor"):
+                if "single_transformer_blocks" in name:
+                    module.set_processor(FluxSingleAttnProcessor2_0(parallel_args))
+                else:
+                    if txt_split:
+                        module.set_processor(FluxAttnProcessor2_0(parallel_args))
+                    else:
+                        module.set_processor(FluxAttnProcessor2_0_TxtNonSplit(parallel_args))
+
+            for sub_name, child in module.named_children():
+                fn_recursive_attn_processor(f"{name}.{sub_name}", child)
+
+        for name, module in model.named_children():
+            fn_recursive_attn_processor(name, module)
+    set_parallel_attn_processor(transformer)
     return pipe

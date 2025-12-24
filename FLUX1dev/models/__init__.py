@@ -14,4 +14,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .modeling_utils import ModelMixin
-from .transformer_flux import FluxTransformer2DModel
+from .transformer_flux import init_double_stream, FluxTransformer2DModel

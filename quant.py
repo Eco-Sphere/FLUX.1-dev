@@ -28,10 +28,12 @@ from msmodelslim.quant import M4ProcessorConfig, W8A8DynamicQuantConfig, \
 
 from FLUX1dev import FluxPipeline
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
-from FLUX1dev.quant.dump_utils import InputCapture, DumperManager, get_disable_layer_names
+from FLUX1dev.quant.dump_utils import InputCapture, DumperManager, get_disable_layer_names, to_device
 
-from inference_flux import PromptLoader
+from prompt_loader import PromptLoader
 from FLUX1dev.quant.flux_adapter import FluxAdapter
+from transformers import T5EncoderModel
+from mindiesd import CacheAgent, CacheConfig
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
 
@@ -40,13 +42,13 @@ dtype_map = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=str, default="./flux", help="Path to the flux model directory")
     parser.add_argument("--calib_dataset_path", type=str, default="./calib_dataset", help="Path to the flux model directory")
     parser.add_argument("--device_id", type=int, default=0, help="NPU device id")
     parser.add_argument("--data_type", choices=["bfloat16", "float16", "float32"], default="bfloat16", help="specify infer prompt type")
-    parser.add_argument("--device_type", choices=["A2-32g", "A2-64g"], default="A2-64g", help="specify device type")
     parser.add_argument("--prompt_path", type=str, default="./prompts.txt", help="input prompt text path")
     parser.add_argument("--prompt_type", choices=["plain", "parti", "hpsv2"], default="plain", help="specify infer prompt type")
     parser.add_argument("--width", type=int, default=1024, help='Image size width')
@@ -56,6 +58,8 @@ def parse_arguments():
     parser.add_argument("--use_calib_data", action="store_true", help="use calib data or not")
     parser.add_argument("--calib_data_nums", type=int, default=5, help="specify calib data nums for quant")
     parser.add_argument("--quant_type", choices=["w8a16", "w8a8_dynamic"], default="w8a8_dynamic", help="specify quant type")
+    # ======================== Cpu offload config ========================
+    parser.add_argument("--cpu_offload", action="store_true", help="when use 32g device, turn on cpu offload.")
     return parser.parse_args()
 
 
@@ -76,16 +80,43 @@ def set_seed(args):
 
 
 def initialize_pipeline(args):
+    torch.npu.set_device(args.device_id)
+    device = torch.device(f"npu:{args.device_id}")
+
     check_dir_safety(args.path)
-    data_type = dtype_map[args.data_type]
+    T5_model_path = os.path.join(args.path, "text_encoder_2")
+    T5_model = T5EncoderModel.from_pretrained(T5_model_path).to(torch.bfloat16)
 
-    pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=data_type, local_files_only=True)
+    pipe = FluxPipeline.from_pretrained(args.path, torch_dtype=torch.bfloat16, local_files_only=True)
+        
+    d_stream_config = CacheConfig(
+        method="dit_block_cache",
+        blocks_count=19,
+        steps_count=args.infer_steps,
+        step_start=args.infer_steps,
+        step_interval=2,
+        block_start=18,
+        block_end=18,
+    )
+    d_stream_agent = CacheAgent(d_stream_config)
+    pipe.transformer.d_stream_agent = d_stream_agent
+    s_stream_config = CacheConfig(
+        method="dit_block_cache",
+        blocks_count=38,
+        steps_count=args.infer_steps,
+        step_start=args.infer_steps,
+        step_interval=2,
+        block_start=37,
+        block_end=37,
+    )
+    s_stream_agent = CacheAgent(s_stream_config)
+    pipe.transformer.s_stream_agent = s_stream_agent
 
-    if args.device_type == "A2-32g":
-        pipe.enable_model_cpu_offload(gpu_id=args.device_id)
+    if not args.cpu_offload:
+        pipe.to(device)
     else:
-        pipe.to(f"npu:{args.device_id}")
-    
+        pipe.enable_model_cpu_offload()
+
     return pipe
 
 
@@ -121,6 +152,7 @@ def get_calib_dataset(args, pipe, model):
 def quant(args):
     set_seed(args)
     torch.npu.set_device(args.device_id)
+    device = torch.device(f"npu:{args.device_id}")
     pipe = initialize_pipeline(args)
     data_type = dtype_map[args.data_type]
 
@@ -132,6 +164,7 @@ def quant(args):
 
     if args.use_calib_data:
         calib_dataset = get_calib_dataset(args, pipe, model)
+        calib_dataset = to_device(calib_dataset, device, depth=0)
     else:
         calib_dataset = None
 
@@ -160,26 +193,19 @@ def quant(args):
             part_file_size=None)
 
     else:
-        disable_names = get_disable_layer_names(
-            model,
-            layer_include=['*transformer_blocks*', '*single_transformer_blocks*'],
-            layer_exclude=[
-                '*net.2*',
-                ]
-        )
-        disable_anti_names = []
-
         session_cfg = SessionConfig(
             processor_cfg_map={
-            "m4": M4ProcessorConfig(
-                disable_anti_names=disable_anti_names,
-                alpha=0.8
-            ),
+            "m4": M4ProcessorConfig(),
             "w8a8_dynamic": W8A8DynamicProcessorConfig(
                 cfg=W8A8DynamicQuantConfig(
                     act_method='minmax'
                 ),
-                disable_names=disable_names,
+                disable_names=get_disable_layer_names(
+                    model,
+                    layer_include='*',
+                    layer_exclude='*net.2*',
+                ),
+
             ),
             "save": SaveProcessorConfig(
                 output_path=save_path,
@@ -193,7 +219,6 @@ def quant(args):
         device='npu',
         dev_id=args.device_id,
         )
-
         # pydantic库自带的数据类型校验
         session_cfg.model_validate(session_cfg)
 
