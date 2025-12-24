@@ -405,6 +405,7 @@ class FluxAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self.use_la = bool(int(os.environ.get("ENABLE_LA", 0)))
         self.use_fuse_rope = bool(int(os.environ.get("ROPE_FUSE", 0)))
         self.use_fuse_rmsnorm = bool(int(os.environ.get("RMSNORM_FUSE", 0)))
 
