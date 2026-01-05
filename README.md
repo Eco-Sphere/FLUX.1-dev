@@ -50,7 +50,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
 ### 2.3 安装MindIE SD
-
+安装方式详见[developer_guide](https://gitcode.com/Ascend/MindIE-SD/blob/master/docs/developer_guide.md)
 源码编译
 ```shell
 git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD && git checkout dev
@@ -97,7 +97,7 @@ export CPLUS_INCLUDE_PATH=/usr/include/c++/12/:/usr/include/c++/12/aarch64-openE
 
 ### 2.6 下载本仓库
 ```shell
-   git clone https://modelers.cn/MindIE/FLUX.1-dev.git
+git clone https://modelers.cn/MindIE/FLUX.1-dev.git
 ```
 
 ### 2.7 安装所需依赖
@@ -168,35 +168,39 @@ export model_path="your local flux model path"
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
 
+# 等价优化
+export RMSNORM_FUSE=1   
+export ROPE_FUSE=1      
+export POSEMB_CACHE=1   
+export ENABLE_LA=1        
+export ADALN_FUSE=1     
+export FAST_GELU=1      
+export USE_NZ=1         
+export CV_PARALLEL_LEVEL=2  
+
 python inference_flux.py \
        --path ${model_path} \
        --save_path "./res" \
+       --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
        --device_id 0 \
        --device "npu" \
-       --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
-       --seed 42 \
-       --use_cache \
-       --device_type "A2-64g" \
-       --batch_size 1
+       --seed 42
 ```
 参数说明：
 - path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
 - save_path: 保存图像路径，默认当前文件夹下的res文件夹
+- prompt: 用于图像生成的文字描述提示
 - device_id: 推理设备ID，默认值设置为0
 - device: 推理设备类型，默认为npu
-- prompt_path: 用于图像生成的文字描述提示的列表文件路径
 - width: 图像生成的宽度，默认1024
 - height: 图像生成的高度，默认1024
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
-- use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g、A2-64g两个选项
-- batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 
-### 4.1 Atlas-800I-A2-64g双卡推理性能测试
+### 4.2 Atlas-800I-A2-64g双卡推理性能测试
 1. 设置权重路径：
 ```bash
 export model_path="your local flux model path"
@@ -207,19 +211,28 @@ export model_path="your local flux model path"
 # 在环境中导入以下环境变量提高推理性能
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
+export HCCL_OP_EXPANSION_MODE="AIV"
+
+# 等价优化
+export RMSNORM_FUSE=1   
+export ROPE_FUSE=1      
+export POSEMB_CACHE=1   
+export ENABLE_LA=1        
+export ADALN_FUSE=1     
+export FAST_GELU=1      
+export USE_NZ=1         
+export CV_PARALLEL_LEVEL=0
+export TXT_SPLIT=1
 
 ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 inference_flux.py \
        --path ${model_path} \
-       --save_path "./res" \
+       --save_path "./res_4npu_txtsplit_commoverlap" \
+       --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
        --device "npu" \
-       --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --use_cache \
-       --device_type "A2-64g" \
-       --batch_size 1 \
        --sequence_parallel
 ```
 参数说明：
@@ -228,122 +241,44 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
 - nproc_per_node: 分布式推理使用的NPU数量，设置为2
 - path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
 - save_path: 保存图像路径，默认当前文件夹下的res文件夹
+- prompt: 用于图像生成的文字描述提示
 - device: 推理设备类型，默认为npu
-- prompt_path: 用于图像生成的文字描述提示的列表文件路径
 - width: 图像生成的宽度，默认1024
 - height: 图像生成的高度，默认1024
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
-- use_cache: 是否开启dit cache近似优化
-- device_type: device类型，有A2-32g、A2-64g两个选项
-- batch_size: 指定prompt的batch size，默认为1，大于1时以list形式送入pipeline
 - sequence_parallel: 指定开启双芯SP并行
 
-### 4.3 Atlas-800I-A2-32g单卡推理性能测试
-1. 设置权重路径：
-```bash
-export model_path="your local flux model path"
-```
-
-2. 执行命令：
-```shell
-# 在环境中导入以下环境变量提高推理性能
-export CPU_AFFINITY_CONF=2
-export TASK_QUEUE_ENABLE=2
-
-python inference_flux.py \
-       --path ${model_path} \
-       --save_path "./res" \
-       --device_id 0 \
-       --device "npu" \
-       --prompt_path "./prompts.txt" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --use_cache \
-       --device_type "A2-32g"
-```
-参数说明参照Atlas-800I-A2-64g参数说明
-
-### 4.4 Atlas-800I-A2-32g双卡TP并行推理性能测试
-1. 设置权重路径：
-```bash
-export model_path="your local flux model path"
-```
-
-2.执行命令进行权重切分
-```shell
-python3 tpsplit_weight.py --path ${model_path}
-```
-备注：权重切分成功后，会在模型权重目录生成'transformer_0'与'transformer_1'两个文件夹，两个文件夹下内容与初始transformer文件夹文件相同，但大小不同，执行du -sh，大小应为15G
-
-3.修改transformer_0与transformer_1下的config文件，添加is_tp变量：
-```json
-{
-  "_class_name": "FluxTransformer2DModel",
-  "_diffusers_version": "0.30.0.dev0",
-  "_name_or_path": "../checkpoints/flux-dev/transformer",
-  "attention_head_dim": 128,
-  "guidance_embeds": true,
-  "in_channels": 64,
-  "joint_attention_dim": 4096,
-  "num_attention_heads": 24,
-  "num_layers": 19,
-  "num_single_layers": 38,
-  "patch_size": 1,
-  "pooled_projection_dim": 768,
-  "is_tp": true
-}
-```
-
-4. 执行命令：
-```shell
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py \
-       --path ${model_path} \
-       --prompt_path "./prompts.txt" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --use_cache \
-       --tensor_parallel
-
-```
-参数说明：
-- tensor_parallel: 指定开启双芯TP并行
-其余参数说明参照Atlas-800I-A2-64g参数说明
-
-
-### 4.5 Atlas-800I-A2-32g单卡w8a16量化推理性能测试
-#### 4.5.1 安装量化工具msModelSlim
+### 4.3 Atlas-800I-A2-64g单卡w8a16量化推理性能测试
+#### 4.3.1 安装量化工具msModelSlim
 参考[官方README](https://gitee.com/ascend/msit/tree/master/msmodelslim)
 1.git clone下载msit仓代码
 2.进入到msit/msmodelslim的目录 cd msit/msmodelslim；并在进入的msmodelslim目录下，运行安装脚本 bash install.sh
-#### 4.5.2 w8a16量化
+#### 4.3.2 w8a16量化
 执行命令：
 ```shell
+# 设置权重路径
+export model_path="your local flux model path"
 # 指定量化类型
 export quant_type="w8a16"
 
 python quant.py \
        --path ${model_path} \
-       --device_id 7 \
+       --device_id 0 \
        --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --device_type "A2-32g" \
        --quant_type ${quant_type}
 ```
 参数说明：
+- prompt_path: 用于图像生成的文字描述提示的列表文件路径
 - quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 备注：量化成功后，会在模型权重目录生成'quant_weights_w8a16'一个文件夹，文件夹下包含两个文件'quant_model_description_w8a16.json'和'quant_model_weight_w8a16.safetensors'
 
-#### 4.5.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+#### 4.3.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
 1. 获取安装包
 - 支持设备：[Atlas 800I A2](https://www.hiascend.com/developer/download/community/result?module=pt+ie+cann&product=4&model=32)
 - [环境准备指导](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha001/softwareinst/instg/instg_0003.html)
@@ -358,223 +293,99 @@ chmod +x Ascend-cann-nnal_<version>_linux-<arch>.run
 source ${HOME}/Ascend/nnal/atb/set_env.sh
 ```
 
-#### 4.5.4 Atlas-800I-A2-32g单卡w8a16量化推理性能测试
+#### 4.3.4 Atlas-800I-A2-64g单卡w8a16量化推理性能测试
 执行命令：
 ```shell
+# 设置权重路径
+export model_path="your local flux model path"
+# 指定量化类型
+export quant_type="w8a16"
+
 # 在环境中导入以下环境变量提高推理性能
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
-# 指定量化类型
-export quant_type="w8a16"
 
 python inference_flux.py \
        --path ${model_path} \
        --save_path "./res" \
+       --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
        --device_id 0 \
        --device "npu" \
-       --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --use_cache \
-       --device_type "A2-32g" \
        --use_quant \
        --quant_type ${quant_type}
-
 ```
 参数说明：
 - use_quant: 指定使用量化模型
 - quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
-### 4.6 Atlas-800I-A2-32g单卡w8a8_dynamic量化推理性能测试
-#### 4.6.1 安装量化工具msModelSlim
-参照Atlas-800I-A2-32g单卡w8a16安装量化工具msModelSlim说明
+### 4.4 Atlas-800I-A2-64g单卡w8a8_dynamic量化推理性能测试
+#### 4.4.1 安装量化工具msModelSlim
+参照Atlas-800I-A2-64g单卡w8a16安装量化工具msModelSlim说明
 
-#### 4.6.2 w8a8_dynamic量化
+#### 4.4.2 w8a8_dynamic量化
 执行命令：
 ```shell
+# 设置权重路径
+export model_path="your local flux model path"
+# 指定量化类型
 export quant_type="w8a8_dynamic"
+
 python quant.py \
        --path ${model_path} \
-       --device_id 7 \
+       --device_id 0 \
        --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --device_type "A2-32g" \
        --use_calib_data \
        --quant_type ${quant_type}
 ```
 参数说明：
+- prompt_path: 用于图像生成的文字描述提示的列表文件路径
+- use_calib_data: 指定使用校准数据
 - quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 备注：量化成功后，会在模型权重目录生成'quant_weights_w8a8_dynamic'一个文件夹，文件夹下包含两个文件'quant_model_description_w8a8_dynamic.json'和'quant_model_weight_w8a8_dynamic.safetensors'
 
-#### 4.6.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
-参照Atlas-800I-A2-32g单卡w8a16安装量化模型推理工具NNAL神经网络加速库和torch_atb说明
+#### 4.4.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+参照Atlas-800I-A2-64g单卡w8a16安装量化模型推理工具NNAL神经网络加速库和torch_atb说明
 
-#### 4.6.4 Atlas-800I-A2-32g单卡w8a8_dynamic量化推理性能测试
+#### 4.4.4 Atlas-800I-A2-64g单卡w8a8_dynamic量化推理性能测试
 执行命令：
 ```shell
+# 设置权重路径
+export model_path="your local flux model path"
+# 指定量化类型
+export quant_type="w8a8_dynamic"
+
 # 在环境中导入以下环境变量提高推理性能
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
-# 指定量化类型
-export quant_type="w8a8_dynamic"
 
 python inference_flux.py \
        --path ${model_path} \
        --save_path "./res" \
+       --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
        --device_id 0 \
        --device "npu" \
-       --prompt_path "./prompts.txt" \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --use_cache \
-       --device_type "A2-32g" \
        --use_quant \
        --quant_type ${quant_type}
-
 ```
 参数说明：
 - use_quant: 指定使用量化模型
 - quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
-### 4.7 精度测试
-#### 4.7.1 ClipScore测试
-1.准备模型与数据集
-```shell
-# 下载Parti数据集
-wget https://raw.githubusercontent.com/google-research/parti/main/PartiPrompts.tsv --no-check-certificate
-
-# 下载clip模型
-# 安装git-lfs
-apt install git-lfs
-git lfs install
-
-git clone https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K
-```
-也可手动下载[clip模型](https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/blob/main/open_clip_pytorch_model.bin)权重
-
-2.推理Parti数据集，生成图像
-```shell
-# 单卡64G Flux 等价优化推理
-python inference_flux.py \
-       --path ${model_path} \
-       --save_path "./clipscore_res_wocache" \
-       --device_id 0 \
-       --device "npu" \
-       --prompt_path "./PartiPrompts.tsv" \
-       --prompt_type "parti" \
-       --num_images_per_prompt 4 \
-       --info_file_save_path "./clip_info_wocache.json" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --device_type "A2-64g"
-# 单卡64G Flux 近似优化推理
-python inference_flux.py \
-       --path ${model_path} \
-       --save_path "./clipscore_res_wcache" \
-       --device_id 0 \
-       --device "npu" \
-       --prompt_path "./PartiPrompts.tsv" \
-       --prompt_type "parti" \
-       --num_images_per_prompt 4 \
-       --info_file_save_path "./clip_info_wcache.json" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --use_cache \
-       --device_type "A2-64g"
-# 双卡32G Flux等价优化推理
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py --device_type "A2-32g-dual" --path ${model_path} --prompt_path "./PartiPrompts.tsv" --prompt_type "parti" --num_images_per_prompt 4 --info_file_save_path "./clip_info_wocache.json" --width 1024 --height 1024 --infer_steps 50 --seed 42
-# 双卡32G Flux近似优化推理
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py --device_type "A2-32g-dual" --path ${model_path} --prompt_path "./PartiPrompts.tsv" --prompt_type "parti" --num_images_per_prompt 4 --info_file_save_path "./clip_info_wcache.json" --width 1024 --height 1024 --infer_steps 50 --seed 42 --use_cache
-```
-3.执行推理脚本计算clipscore
-```shell
-# 等价优化
-python clipscore.py \
-       --device="cpu" \
-       --image_info="clip_info_wocache.json" \
-       --model_name="ViT-H-14" \
-       --model_weights_path="./CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin"
-# 近似优化
-python clipscore.py \
-       --device="cpu" \
-       --image_info="clip_info_wcache.json" \
-       --model_name="ViT-H-14" \
-       --model_weights_path="./CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin"
-```
-参数说明
-- device: 推理设备，默认使用cpu做计算。
-- image_info: 上一步生成的json文件。
-- model_name: Clip模型名称。
-- model_weights_path: Clip模型权重文件路径。
-
-#### 4.7.2 Hpsv2精度测试
-1.准备模型与数据集
-
-[hpsv2数据集获取](https://gitee.com/ascend/ModelZoo-PyTorch/blob/master/MindIE/MindIE-Torch/built-in/foundation/stable_diffusion_xl/hpsv2_benchmark_prompts.json)
-```shell
-# 下载权重
-wget https://huggingface.co/spaces/xswu/HPSv2/resolve/main/HPS_v2_compressed.pt --no-check-certificate
-```
-2.执行hpsv2数据集，生成图像
-```shell
-#单卡64G Flux等价优化推理
-python inference_flux.py \
-       --path ${model_path} \
-       --save_path "./hpsv2_res_wocache" \
-       --device_id 0 \
-       --device "npu" \
-       --prompt_type "hpsv2" \
-       --num_images_per_prompt 1 \
-       --info_file_save_path "./hpsv2_info_wocache.json" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --device_type "A2-64g"
-#单卡64G Flux近似优化推理
-python inference_flux.py \
-       --path ${model_path} \
-       --save_path "./hpsv2_res_wcache" \
-       --device_id 0 \
-       --device "npu" \
-       --prompt_type "hpsv2" \
-       --num_images_per_prompt 1 \
-       --info_file_save_path "./hpsv2_info_wcache.json" \
-       --width 1024 \
-       --height 1024 \
-       --infer_steps 50 \
-       --seed 42 \
-       --use_cache \
-       --device_type "A2-64g"
-# 双卡32G Flux等价优化推理
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py --device_type "A2-32g-dual" --path ${model_path} --prompt_type "hpsv2" --num_images_per_prompt 1 --info_file_save_path "./hpsv2_info_wocache.json" --width 1024 --height 1024 --infer_steps 50 --seed 42
-# 双卡32G Flux近似优化推理
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=2002 --nproc_per_node=2 inference_flux.py --device_type "A2-32g-dual" --path ${model_path} --prompt_type "hpsv2" --num_images_per_prompt 1 --info_file_save_path "./hpsv2_info_wocache.json" --width 1024 --height 1024 --infer_steps 50 --seed 42 --use_cache
-```
-3.执行推理脚本计算hpsv2
-```shell
-python hpsv2_score.py \
-       --image_info="hpsv2_info_wocache.json" \
-       --HPSv2_checkpoint="./HPS_v2_compressed.pt" \
-       --clip_checkpoint="./CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.bin"
-```
-- image_info: 上一步生成的json文件。
-- HPSv2_checkpoint: HPSv2模型权重文件路径。
-- clip_checkpointh: Clip模型权重文件路径。
 
 ## 五、推理结果参考
 ### Flux.1-DEV性能数据
