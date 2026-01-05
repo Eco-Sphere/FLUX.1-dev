@@ -29,7 +29,6 @@ from mindiesd import CacheAgent, CacheConfig
 from FLUX1dev import BlockOffloadHookV2
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
-from FLUX1dev.models import init_double_stream
 from FLUX1dev.utils import check_prompts_valid, check_param_valid, check_dir_safety, check_file_safety
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
@@ -99,6 +98,32 @@ def transfer_nd_to_nz(pipe):
             continue
         if hasattr(getattr(pipe, attr), "named_modules"):
             _transpose_to_nz(getattr(pipe, attr))
+
+
+def init_cv_parallel(cp_level):
+    """
+    Initialize computer vision parallel processing based on the specified level.
+    
+    Args:
+        cp_level (int): The level of parallel processing to enable.
+                        - 0: No parallel processing
+                        - 1: Enable double stream
+                        - 2: Enable double stream and attention double stream
+    """
+    if cp_level == 1:
+        from FLUX1dev.models import init_double_stream
+        init_double_stream()
+        print("CV parallel level 1 enabled")
+    elif cp_level == 2:
+        from FLUX1dev.models import init_double_stream
+        from FLUX1dev.layers import init_attn_double_stream
+        init_double_stream()
+        init_attn_double_stream()
+        print("CV parallel level 2 enabled")
+    elif cp_level == 0:
+        print("CV parallel disabled")
+    else:
+        print(f"Invalid CV parallel level '{cp_level}'. Valid levels are 0, 1, or 2. No parallel processing enabled")
 
 
 def initialize_pipeline(args):
@@ -236,8 +261,8 @@ def initialize_pipeline(args):
     if bool(os.environ.get("USE_NZ", 0)):
         transfer_nd_to_nz(pipe)
 
-    if bool(int(os.environ.get("DOUBLE_STREAM", 0))):
-        init_double_stream()
+    cp_level = int(os.environ.get("CV_PARALLEL_LEVEL", 0))
+    init_cv_parallel(cp_level)
     return pipe
 
 def set_seed(seed):

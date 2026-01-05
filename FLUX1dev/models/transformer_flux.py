@@ -261,7 +261,8 @@ class FluxTransformerBlock(nn.Module):
         self.is_tp = is_tp
 
         self.adalayernorm_fused = bool(int(os.environ.get("ADALN_FUSE", 0)))
-        self.double_stream = bool(int(os.environ.get("DOUBLE_STREAM", 0)))
+        cp_level = int(os.environ.get("CV_PARALLEL_LEVEL", 0))
+        self.double_stream = bool(cp_level==1 or cp_level==2)
 
     def forward(
         self,

@@ -31,6 +31,25 @@ from ..utils import get_local_rank, get_world_size
 
 logger = logging.get_logger(__name__)
 
+attn_current_stream = None
+attn_stream2 = None
+attn_current_event = None
+attn_event_single = None
+attn_event_double = None
+
+def init_attn_double_stream():
+    global attn_current_stream
+    global attn_stream2
+    global attn_current_event
+    global attn_event_single
+    global attn_event_double
+    attn_current_stream = torch.npu.current_stream()
+    attn_stream2 = torch.npu.Stream()
+    attn_current_event = torch.npu.Event()
+    attn_event_single = torch.npu.Event()
+    attn_event_double = torch.npu.Event()
+
+
 def apply_fa(query, key, value, attention_mask, use_la=False):
     batch_size = query.shape[0]
     heads = query.shape[-2]
@@ -334,8 +353,10 @@ class FluxSingleAttnProcessor2_0:
         self.use_la = bool(int(os.environ.get("ENABLE_LA", 0)))
         self.use_fuse_rope = bool(int(os.environ.get("ROPE_FUSE", 0)))
         self.use_fuse_rmsnorm = bool(int(os.environ.get("RMSNORM_FUSE", 0)))
+        self.enable_cv_parallel = bool(int(os.environ.get("CV_PARALLEL_LEVEL", 0))==2)
 
-    def __call__(
+
+    def forward_native(
         self,
         attn: Attention,
         hidden_states: torch.Tensor,
@@ -344,17 +365,16 @@ class FluxSingleAttnProcessor2_0:
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         input_ndim = hidden_states.ndim
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
 
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        else:
+            batch_size, _, _ = encoder_hidden_states.shape
 
         query = attn.to_q(hidden_states)
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
@@ -366,7 +386,6 @@ class FluxSingleAttnProcessor2_0:
         head_dim = inner_dim // attn_heads
 
         query = query.view(batch_size, -1, attn_heads, head_dim)
-
         key = key.view(batch_size, -1, attn_heads, head_dim)
         value = value.view(batch_size, -1, attn_heads, head_dim)
 
@@ -384,11 +403,11 @@ class FluxSingleAttnProcessor2_0:
                 query = apply_rotary_emb(query, image_rotary_emb, layout="BSND")
                 key = apply_rotary_emb(key, image_rotary_emb, layout="BSND")
 
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
         hidden_states = apply_fa(query, key, value, attention_mask, use_la=self.use_la)
         hidden_states = hidden_states.to(query.dtype)
-        B, S, H = hidden_states.shape
+        
         if attn.is_tp:
+            B, S, H = hidden_states.shape
             hidden_states_full = torch.empty([attn.world_size, B, S, H], dtype=hidden_states.dtype, device=hidden_states.device)
             dist.all_gather_into_tensor(hidden_states_full, hidden_states)
             hidden_states = hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
@@ -396,6 +415,106 @@ class FluxSingleAttnProcessor2_0:
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
+        return hidden_states
+
+    def forward_parallel(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_ndim = hidden_states.ndim
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        else:
+            batch_size, _, _ = encoder_hidden_states.shape
+
+        query = attn.to_q(hidden_states)
+        attn_current_event.record(attn_current_stream)
+
+        with torch.npu.stream(attn_stream2):
+            attn_stream2.wait_event(attn_current_event)
+            key = attn.to_k(encoder_hidden_states)
+            attn_event_single.record(attn_stream2)
+    
+        inner_dim = query.shape[-1]
+        if attn.is_tp:
+            attn_heads = attn.heads // attn.world_size
+        else:
+            attn_heads = attn.heads
+        head_dim = inner_dim // attn_heads
+        query = query.view(batch_size, -1, attn_heads, head_dim)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query, if_fused=self.use_fuse_rmsnorm)
+        if image_rotary_emb is not None:
+            if self.use_fuse_rope:
+                query = apply_rotary_emb_mindiesd(query, image_rotary_emb, layout="BSND")
+            else:
+                query = apply_rotary_emb(query, image_rotary_emb, layout="BSND")
+        attn_current_stream.wait_event(attn_event_single)
+        attn_current_event.record(attn_current_stream)
+
+        with torch.npu.stream(attn_stream2):
+            attn_stream2.wait_event(attn_current_event)
+            value = attn.to_v(encoder_hidden_states)
+            attn_event_single.record(attn_stream2)
+
+        key = key.view(batch_size, -1, attn_heads, head_dim)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key, if_fused=self.use_fuse_rmsnorm)
+        if image_rotary_emb is not None:
+            if self.use_fuse_rope:
+                key = apply_rotary_emb_mindiesd(key, image_rotary_emb, layout="BSND")
+            else:
+                key = apply_rotary_emb(key, image_rotary_emb, layout="BSND")
+        attn_current_stream.wait_event(attn_event_single)
+
+        value = value.view(batch_size, -1, attn_heads, head_dim)
+
+        hidden_states = apply_fa(query, key, value, attention_mask, use_la=self.use_la)
+        hidden_states = hidden_states.to(query.dtype)
+        
+        if attn.is_tp:
+            B, S, H = hidden_states.shape
+            hidden_states_full = torch.empty([attn.world_size, B, S, H], dtype=hidden_states.dtype, device=hidden_states.device)
+            dist.all_gather_into_tensor(hidden_states_full, hidden_states)
+            hidden_states = hidden_states_full.permute(1, 2, 0, 3).reshape([B, S, 2 * H])
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        return hidden_states
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not self.enable_cv_parallel:
+            hidden_states = self.forward_native(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                image_rotary_emb
+            )
+        else:
+            hidden_states = self.forward_parallel(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                image_rotary_emb
+            )
         return hidden_states
 
 
@@ -408,8 +527,9 @@ class FluxAttnProcessor2_0:
         self.use_la = bool(int(os.environ.get("ENABLE_LA", 0)))
         self.use_fuse_rope = bool(int(os.environ.get("ROPE_FUSE", 0)))
         self.use_fuse_rmsnorm = bool(int(os.environ.get("RMSNORM_FUSE", 0)))
+        self.enable_cv_parallel = bool(int(os.environ.get("CV_PARALLEL_LEVEL", 0))==2)
 
-    def __call__(
+    def forward_native(
         self,
         attn: Attention,
         hidden_states: torch.FloatTensor,
@@ -429,8 +549,8 @@ class FluxAttnProcessor2_0:
         if context_input_ndim == 4:
             batch_size, channel, height, width = encoder_hidden_states.shape
             encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        batch_size = encoder_hidden_states.shape[0]
+        else:
+            batch_size = encoder_hidden_states.shape[0]
 
         # `sample` projections.
         query = attn.to_q(hidden_states)
@@ -518,3 +638,164 @@ class FluxAttnProcessor2_0:
 
         return hidden_states, encoder_hidden_states
 
+    def forward_parallel(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pre_encoder_query: Optional[torch.Tensor] = None,
+        pre_encoder_key: Optional[torch.Tensor] = None,
+        pre_encoder_value: Optional[torch.Tensor] = None,
+        cal_encoder_qkv: bool=True
+    ) -> torch.FloatTensor:
+        
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        context_input_ndim = encoder_hidden_states.ndim
+        if context_input_ndim == 4:
+            batch_size, channel, height, width = encoder_hidden_states.shape
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        else:
+            batch_size = encoder_hidden_states.shape[0]
+
+        query = attn.to_q(hidden_states)
+        inner_dim = query.shape[-1]
+        if attn.is_tp:
+            attn_heads = attn.heads // attn.world_size
+        else:
+            attn_heads = attn.heads
+        head_dim = inner_dim // attn_heads
+
+        attn_current_event.record(attn_current_stream)
+
+        with torch.npu.stream(attn_stream2):
+            attn_stream2.wait_event(attn_current_event)
+            key = attn.to_k(hidden_states)
+            attn_event_double.record(attn_stream2)
+
+        query = query.view(batch_size, -1, attn_heads, head_dim)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query, if_fused=self.use_fuse_rmsnorm)
+        if cal_encoder_qkv:
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+        else:
+            encoder_hidden_states_query_proj = pre_encoder_query
+        encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
+            batch_size, -1, attn_heads, head_dim
+        )
+        if attn.norm_added_q is not None:
+            encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj, if_fused=self.use_fuse_rmsnorm)
+        query = torch.cat([encoder_hidden_states_query_proj, query], dim=1)
+        if image_rotary_emb is not None:
+            if self.use_fuse_rope:
+                query = apply_rotary_emb_mindiesd(query, image_rotary_emb, layout="BSND")
+            else:
+                query = apply_rotary_emb(query, image_rotary_emb, layout="BSND")
+        attn_current_stream.wait_event(attn_event_double)
+        attn_current_event.record(attn_current_stream)
+
+        with torch.npu.stream(attn_stream2):
+            attn_stream2.wait_event(attn_current_event)
+            value = attn.to_v(hidden_states)
+            attn_event_double.record(attn_stream2)
+
+        key = key.view(batch_size, -1, attn_heads, head_dim)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key, if_fused=self.use_fuse_rmsnorm)
+        if cal_encoder_qkv:
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+        else:
+            encoder_hidden_states_key_proj = pre_encoder_key
+        encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
+            batch_size, -1, attn_heads, head_dim
+        )
+        if attn.norm_added_k is not None:
+            encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj, if_fused=self.use_fuse_rmsnorm)
+        key = torch.cat([encoder_hidden_states_key_proj, key], dim=1)
+        if image_rotary_emb is not None:
+            if self.use_fuse_rope:
+                key = apply_rotary_emb_mindiesd(key, image_rotary_emb, layout="BSND")
+            else:
+                key = apply_rotary_emb(key, image_rotary_emb, layout="BSND")
+
+        attn_current_stream.wait_event(attn_event_double)
+        value = value.view(batch_size, -1, attn_heads, head_dim)
+
+        # `context` projections.
+        if cal_encoder_qkv:
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+        else:
+            encoder_hidden_states_value_proj = pre_encoder_value
+
+        encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
+            batch_size, -1, attn_heads, head_dim
+        )
+        value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
+        
+        hidden_states = apply_fa(query, key, value, attention_mask, use_la=self.use_la)
+        hidden_states = hidden_states.to(query.dtype)
+
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, : encoder_hidden_states.shape[1]],
+            hidden_states[:, encoder_hidden_states.shape[1] :],
+        )
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+        if attn.is_tp:
+            dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM)
+        encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+        if attn.is_tp:
+            dist.all_reduce(encoder_hidden_states, op=dist.ReduceOp.SUM)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+        if context_input_ndim == 4:
+            encoder_hidden_states = encoder_hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        return hidden_states, encoder_hidden_states
+    
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pre_encoder_query: Optional[torch.Tensor] = None,
+        pre_encoder_key: Optional[torch.Tensor] = None,
+        pre_encoder_value: Optional[torch.Tensor] = None,
+        cal_encoder_qkv: bool=True
+    ) -> torch.FloatTensor:
+        
+        if not self.enable_cv_parallel:
+            hidden_states = self.forward_native(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                image_rotary_emb,
+                pre_encoder_query,
+                pre_encoder_key,
+                pre_encoder_value,
+                cal_encoder_qkv
+            )
+        else:
+            hidden_states = self.forward_parallel(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                image_rotary_emb,
+                pre_encoder_query,
+                pre_encoder_key,
+                pre_encoder_value,
+                cal_encoder_qkv
+            )
+        return hidden_states

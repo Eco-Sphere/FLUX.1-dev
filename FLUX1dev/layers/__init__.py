@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .attention_processor import (Attention, FluxAttnProcessor2_0, FluxSingleAttnProcessor2_0)
+from .attention_processor import (Attention, FluxAttnProcessor2_0, FluxSingleAttnProcessor2_0, init_attn_double_stream)
 from .embedding import FluxPosEmbed, apply_rotary_emb, apply_rotary_emb_mindiesd
 from .activation import GELU, enable_fast_gelu
 from .normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
