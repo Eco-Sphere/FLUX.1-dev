@@ -227,7 +227,7 @@ export TXT_SPLIT=1
 
 ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 inference_flux.py \
        --path ${model_path} \
-       --save_path "./res_4npu_txtsplit_commoverlap" \
+       --save_path "./res" \
        --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
        --device "npu" \
        --width 1024 \
