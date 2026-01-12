@@ -187,7 +187,8 @@ python inference_flux.py \
        --width 1024 \
        --height 1024 \
        --infer_steps 50 \
-       --seed 42
+       --seed 42 \
+       --use_cache
 ```
 参数说明：
 - path: Flux本地模型权重路径，默认读取当前文件夹下的flux文件夹
@@ -199,6 +200,7 @@ python inference_flux.py \
 - height: 图像生成的高度，默认1024
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
+- use_cache: 是否开启dit cache近似优化
 
 ### 4.2 Atlas-800I-A2-64g双卡推理性能测试
 1. 设置权重路径：
@@ -234,7 +236,8 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
-       --sequence_parallel
+       --use_cache \
+       --sequence_parallel 
 ```
 参数说明：
 - ASCEND_RT_VISIBLE_DEVICES: shell环境变量，用以绑定推理时实际使用的NPU
@@ -248,6 +251,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 in
 - height: 图像生成的高度，默认1024
 - infer_steps: Flux图像推理步数，默认值为50
 - seed: 设置随机种子，默认值为42
+- use_cache: 是否开启dit cache近似优化
 - sequence_parallel: 指定开启双芯SP并行
 
 ### 4.3 Atlas-800I-A2-64g单卡w8a16量化推理性能测试
@@ -326,6 +330,7 @@ python inference_flux.py \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
+       --use_cache \
        --use_quant \
        --quant_type ${quant_type}
 ```
@@ -399,6 +404,7 @@ python inference_flux.py \
        --height 1024 \
        --infer_steps 50 \
        --seed 42 \
+       --use_cache \
        --use_quant \
        --quant_type ${quant_type}
 ```
