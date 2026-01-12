@@ -306,6 +306,16 @@ export quant_type="w8a16"
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
 
+# 等价优化
+export RMSNORM_FUSE=1   
+export ROPE_FUSE=1      
+export POSEMB_CACHE=1   
+export ENABLE_LA=1        
+export ADALN_FUSE=1     
+export FAST_GELU=1      
+export USE_NZ=1         
+export CV_PARALLEL_LEVEL=2  
+
 python inference_flux.py \
        --path ${model_path} \
        --save_path "./res" \
@@ -368,6 +378,16 @@ export quant_type="w8a8_dynamic"
 # 在环境中导入以下环境变量提高推理性能
 export CPU_AFFINITY_CONF=2
 export TASK_QUEUE_ENABLE=2
+
+# 等价优化
+export RMSNORM_FUSE=1   
+export ROPE_FUSE=1      
+export POSEMB_CACHE=1   
+export ENABLE_LA=1        
+export ADALN_FUSE=1     
+export FAST_GELU=1      
+export USE_NZ=1         
+export CV_PARALLEL_LEVEL=2  
 
 python inference_flux.py \
        --path ${model_path} \
