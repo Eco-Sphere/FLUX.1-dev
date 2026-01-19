@@ -16,7 +16,7 @@ license: apache-2.0
 Flux.1-DEV是一种文本到图像的扩散模型，能够在给定文本输入的情况下生成相符的图像。
 
 本模型使用的优化手段如下：
-等价优化：FA、ROPE、RMSnorm、Fastgelu、ADALN、ND转NZ、缓存复用、CV双流并行、TP并行、SP并行
+等价优化：FA、ROPE、RMSnorm、Fastgelu、ND转NZ、缓存复用、CV双流并行、TP并行、SP并行
 算法优化：量化、DiTCache
 
 ## 二、环境准备
