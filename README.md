@@ -414,6 +414,71 @@ python inference_flux.py \
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
 
+### 4.5 Atlas-800I-A2-32g双卡推理性能测试
+#### 4.5.1 权重切分
+
+```shell
+# 设置权重路径
+export model_path="your local flux model path"
+
+# 执行命令进行权重切分
+python3 tpsplit_weight.py --path ${model_path}
+```
+备注：权重切分成功后，会在模型权重目录生成'transformer_0'与'transformer_1'两个文件夹，两个文件夹下内容与初始transformer文件夹文件相同，但大小不同，执行du -sh，大小应为15G
+
+#### 4.5.2 修改权重的config文件
+修改transformer_0与transformer_1下的config文件，添加is_tp变量：
+```json
+{
+  "_class_name": "FluxTransformer2DModel",
+  "_diffusers_version": "0.30.0.dev0",
+  "_name_or_path": "../checkpoints/flux-dev/transformer",
+  "attention_head_dim": 128,
+  "guidance_embeds": true,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "num_attention_heads": 24,
+  "num_layers": 19,
+  "num_single_layers": 38,
+  "patch_size": 1,
+  "pooled_projection_dim": 768,
+  "is_tp": true
+}
+```
+
+#### 4.5.3 性能测试
+执行命令：
+```shell
+# 设置权重路径
+export model_path="your local flux model path"
+# 在环境中导入以下环境变量
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+# 使能等价优化
+export HCCL_OP_EXPANSION_MODE="AIV"
+export RMSNORM_FUSE=1   
+export ROPE_FUSE=1      
+export POSEMB_CACHE=1   
+export ENABLE_LA=1        
+export ADALN_FUSE=1     
+export FAST_GELU=1    
+
+ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --master_port=20095 --nproc_per_node=2 inference_flux.py \
+       --path ${model_path} \
+       --save_path "./res" \
+       --prompt "Beautiful illustration of The ocean. in a serene landscape, magic realism, narrative realism, beautiful matte painting, heavenly lighting, retrowave, 4 k hd wallpaper" \
+       --device "npu" \
+       --width 1024 \
+       --height 1024 \
+       --infer_steps 50 \
+       --seed 42 \
+       --tensor_parallel \
+       --use_cache
+```
+参数说明：
+- tensor_parallel: 使能TP并行
+其余参数说明参照Atlas-800I-A2-64g参数说明
+
 ## 五、推理结果参考
 ### Flux.1-DEV性能数据
 | 硬件形态  | cpu规格 | batch size | 分辨率 |迭代次数 | 优化手段 | 性能 | 采样器 | 备注 |
