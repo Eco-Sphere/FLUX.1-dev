@@ -331,18 +331,9 @@ class Attention(nn.Module):
         head_dim = query.shape[-1]
 
         # Apply FA Quant
-        if use_fa_quant:
-            if hasattr(self, 'fa_quant'):
-                hidden_states = self.fa_quant(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-                                              layout="BNSD")
-            else:
-                scale = query.shape[-1] ** -0.5
-                hidden_states = torch_npu.npu_fused_infer_attention_score(query.transpose(1, 2), key.transpose(1, 2),
-                                                                          value.transpose(1, 2),
-                                                                          num_heads=query.shape[2], input_layout="BNSD",
-                                                                          scale=scale,
-                                                                          pre_tokens=2147483647,
-                                                                          next_tokens=2147483647)[0]
+        if use_fa_quant and hasattr(self, 'fa_quant'):
+            hidden_states = self.fa_quant(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+                                          layout="BNSD")
             output = hidden_states.transpose(1, 2)
             if world_size == 1:
                 output = output.reshape(batch_size, -1, head_dim * heads)
