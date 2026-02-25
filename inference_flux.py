@@ -26,6 +26,7 @@ from transformers import T5EncoderModel
 
 from mindiesd import CacheAgent, CacheConfig
 
+from .prompt_loader import PromptLoader
 from FLUX1dev import BlockOffloadHookV2
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
@@ -44,7 +45,7 @@ def parse_arguments():
     parser.add_argument("--save_path", type=str, default="./res", help="ouput image path")
     parser.add_argument("--device_id", type=int, default=0, help="NPU device id")
     parser.add_argument("--device", choices=["npu", "cpu"], default="npu", help="NPU")
-    parser.add_argument("--prompt_path", type=str, default="./prompts.txt", help="input prompt text path")
+    parser.add_argument("--prompt_path", type=str, default=None, help="input prompt text path")
     parser.add_argument("--prompt_type", choices=["plain", "parti", "hpsv2"], default="plain", help="specify infer prompt type")
     parser.add_argument("--num_images_per_prompt", type=int, default=1, help="specify image number every prompt generate")
     parser.add_argument("--max_num_prompt", type=int, default=0, help="limit the prompt number[0 indicates no limit]")
@@ -279,39 +280,97 @@ def infer(args):
     check_dir_safety(args.save_path)
     check_param_valid(args.height, args.width, args.infer_steps)
 
-    total_nums = 6
-    warmup_nums = 3
-    time_consume = 0.0
+    if args.prompt_path is None:  
+        total_nums = 6
+        warmup_nums = 3
+        time_consume = 0.0
 
-    for i in range(total_nums):
-        prompts = [args.prompt]
-        torch.npu.synchronize()
-        start_time = time.time()
-        image = pipe(
-            prompts,
-            height=args.width,
-            width=args.height,
-            guidance_scale=3.5,
-            num_inference_steps=args.infer_steps,
-            max_sequence_length=512,
-            use_cache=args.use_cache,
-        )
-        torch.npu.synchronize()
-        end_time = time.time() - start_time
-        print(f"The inference time of the {i} image is: {end_time}")
+        for i in range(total_nums):
+            prompts = [args.prompt]
+            torch.npu.synchronize()
+            start_time = time.time()
+            image = pipe(
+                prompts,
+                height=args.width,
+                width=args.height,
+                guidance_scale=3.5,
+                num_inference_steps=args.infer_steps,
+                max_sequence_length=512,
+                use_cache=args.use_cache,
+            )
+            torch.npu.synchronize()
+            end_time = time.time() - start_time
+            print(f"The inference time of the {i} image is: {end_time}")
 
-        if i > (warmup_nums - 1):
-            time_consume += end_time
+            if i > (warmup_nums - 1):
+                time_consume += end_time
 
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    image_save_path = os.path.join(args.save_path, f"{i}.png")
+                    image[0][0].save(image_save_path)
+            else:
                 image_save_path = os.path.join(args.save_path, f"{i}.png")
                 image[0][0].save(image_save_path)
-        else:
-            image_save_path = os.path.join(args.save_path, f"{i}.png")
-            image[0][0].save(image_save_path)
 
-    print(f"Average inference time is: {time_consume / (total_nums - warmup_nums)}")
+        print(f"Average inference time is: {time_consume / (total_nums - warmup_nums)}")
+
+    else:
+        check_file_safety(args.prompt_path)
+        prompt_loader = PromptLoader(args.prompt_path,
+                                    args.prompt_type,
+                                    args.batch_size,
+                                    args.num_images_per_prompt,
+                                    args.max_num_prompt)
+        infer_num = 0
+        time_consume = 0
+        current_prompt = None
+        image_info = []
+        for _, input_info in enumerate(prompt_loader):
+            prompts = input_info['prompts']
+            save_names = input_info['save_names']
+            catagories = input_info['catagories']
+            save_names = input_info['save_names']
+            n_prompts = input_info['n_prompts']
+
+            check_prompts_valid(prompts)
+
+            print(f"[{infer_num+n_prompts}/{len(prompt_loader)}]: {prompts}")
+            infer_num += args.batch_size
+            if infer_num > 3:
+                start_time = time.time()
+
+            image = pipe(
+                prompts,
+                height=args.width,
+                width=args.height,
+                guidance_scale=3.5,
+                num_inference_steps=args.infer_steps,
+                max_sequence_length=512,
+                use_cache=args.use_cache,
+            )
+
+            if infer_num > 3:
+                end_time = time.time() - start_time
+                time_consume += end_time
+
+            for j in range(n_prompts):
+                image_save_path = os.path.join(args.save_path, f"{save_names[j]}.png")
+                image[0][j].save(image_save_path)
+
+                if current_prompt != prompts[j]:
+                    current_prompt = prompts[j]
+                    image_info.append({'images': [], 'prompt': current_prompt, 'category': catagories[j]})
+
+                image_info[-1]['images'].append(image_save_path)
+        
+        if os.path.exists(args.info_file_save_path):
+            os.remove(args.info_file_save_path)
+
+        with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+            json.dump(image_info, f)
+        image_time_count = len(prompt_loader) - 3
+        print(f"flux pipeline time is:{time_consume/image_time_count}")
 
     return
 
