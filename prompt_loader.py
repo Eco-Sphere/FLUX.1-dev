@@ -38,7 +38,7 @@ class PromptLoader:
         elif prompt_file_type == 'parti':
             self.load_prompts_parti(prompt_file, max_num_prompts)
         elif prompt_file_type == 'hpsv2':
-            self.load_prompts_hpsv2(max_num_prompts)
+            self.load_prompts_hpsv2(prompt_file, max_num_prompts)
         else:
             print("This operation is not supported!")
 
@@ -107,8 +107,8 @@ class PromptLoader:
                 catagory_id = self.catagories.index(catagory)
                 self.prompts.append((prompt, catagory_id))
 
-    def load_prompts_hpsv2(self, max_num_prompts: int):
-        with open('hpsv2_benchmark_prompts.json', 'r') as file:
+    def load_prompts_hpsv2(self, file_path: str, max_num_prompts: int):
+        with open(file_path, 'r') as file:
             all_prompts = json.load(file)
         count = 0
         for style, prompts in all_prompts.items():
