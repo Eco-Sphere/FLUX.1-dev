@@ -26,7 +26,7 @@ from transformers import T5EncoderModel
 
 from mindiesd import CacheAgent, CacheConfig
 
-from .prompt_loader import PromptLoader
+from prompt_loader import PromptLoader
 from FLUX1dev import BlockOffloadHookV2
 from FLUX1dev import FluxPipeline, parallelize_transformer
 from FLUX1dev import get_local_rank, get_world_size, initialize_torch_distributed
