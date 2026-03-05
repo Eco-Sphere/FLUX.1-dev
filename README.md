@@ -413,9 +413,128 @@ python inference_flux.py \
 - quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
+### 4.5 A5单卡w8a8_mxfp8量化推理性能测试
+#### 4.5.1 安装量化工具msModelSlim
+```shell
+# 1. git clone msmodelslim 代码
+git clone https://gitcode.com/Ascend/msmodelslim.git
 
-### 4.5 Atlas-800I-A2-32g双卡推理性能测试
-#### 4.5.1 权重切分
+# 2. 进入到 msmodelslim 的目录并运行安装脚本
+cd msmodelslim
+bash install.sh
+```
+#### 4.5.2 w8a8_mxfp8量化
+```shell
+# 设置权重路径
+export model_path="Your local flux model path"
+# 设置权重保存路径
+export save_path="Your weights save path"
+
+msmodelslim quant \
+    --model_path ${model_path} \
+    --save_path ${save_path} \
+    --device npu \
+    --model_type FLUX.1-dev \
+    --trust_remote_code True \
+    --quant_type w8a8
+```
+
+#### 4.5.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+参照Atlas-800I-A2-64g单卡w8a16安装量化模型推理工具NNAL神经网络加速库和torch_atb说明
+
+#### 4.5.4 单卡w8a8_mxfp8量化推理性能测试
+执行命令
+```shell
+# 设置权重路径
+export model_path="Your local flux model path"
+# 指定量化类型
+export quant_type="w8a8_mxfp8"
+
+# 在环境中导入以下环境变量提高推理性能
+export CPU_AFFINITY_CONF=2
+export TASK_QUEUE_ENABLE=2
+
+#等价优化
+export RMSNORM_FUSE=1
+export ROPE_FUSE=1
+export POSEMB_CACHE=1
+export ADALN_FUSE=1
+export FAST_GELU=1
+export CV_PARALLEL_LEVEL=2
+
+python inference_flux.py \
+      --path ${model_path} \
+      --save_path "./res" \
+      --device_id 0 \
+      --device "npu" \
+      --width 1024 \
+      --height 1024 \
+      --infer_steps 50 \
+      --seed 42 \
+      --use_quant \
+      --quant_type ${quant_type}
+```
+
+### 4.6 A5单卡w8a8_mxfp8加fa量化推理性能测试
+#### 4.6.1 安装量化工具msModelSlim
+参照[4.5.1章节安装量化工具msmodelslim](#451-安装量化工具msmodelslim)说明
+
+#### 4.6.2 w8a8_mxfp8加fa量化
+```shell
+# 设置权重路径
+export model_path="Your local flux model path"
+# 设置权重保存路径
+export save_path="Your weights save path"
+
+msmodelslim quant \
+    --model_path ${model_path} \
+    --save_path ${save_path} \
+    --device npu \
+    --model_type FLUX.1-dev \
+    --trust_remote_code True \
+    --quant_type w8a8c8
+```
+
+#### 4.6.3 安装量化模型推理工具NNAL神经网络加速库和torch_atb
+参照Atlas-800I-A2-64g单卡w8a16安装量化模型推理工具NNAL神经网络加速库和torch_atb说明
+
+#### 4.6.4 单卡w8a8_mxfp8加fa量化推理性能测试
+执行命令
+```shell
+# 设置权重路径
+export model_path="Your local flux model path"
+# 指定量化类型
+export quant_type="w8a8_mxfp8"
+# 开启FA量化
+export USE_FA_QUANT=1
+
+# 在环境中导入以下环境变量提高推理性能
+export CPU_AFFINITY_CONF=2
+export TASK_QUEUE_ENABLE=2
+
+#等价优化
+export RMSNORM_FUSE=1
+export ROPE_FUSE=1
+export POSEMB_CACHE=1
+export ADALN_FUSE=1
+export FAST_GELU=1
+export CV_PARALLEL_LEVEL=2
+
+python inference_flux.py \
+      --path ${model_path} \
+      --save_path "./res" \
+      --device_id 0 \
+      --device "npu" \
+      --width 1024 \
+      --height 1024 \
+      --infer_steps 50 \
+      --seed 42 \
+      --use_quant \
+      --quant_type ${quant_type}
+```
+
+### 4.7 Atlas-800I-A2-32g双卡推理性能测试
+#### 4.7.1 权重切分
 
 ```shell
 # 设置权重路径
@@ -426,7 +545,7 @@ python3 tpsplit_weight.py --path ${model_path}
 ```
 备注：权重切分成功后，会在模型权重目录生成'transformer_0'与'transformer_1'两个文件夹，两个文件夹下内容与初始transformer文件夹文件相同，但大小不同，执行du -sh，大小应为15G
 
-#### 4.5.2 修改权重的config文件
+#### 4.7.2 修改权重的config文件
 修改transformer_0与transformer_1下的config文件，添加is_tp变量：
 ```json
 {
@@ -446,7 +565,7 @@ python3 tpsplit_weight.py --path ${model_path}
 }
 ```
 
-#### 4.5.3 性能测试
+#### 4.7.3 性能测试
 执行命令：
 ```shell
 # 设置权重路径
