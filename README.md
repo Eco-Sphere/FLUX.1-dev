@@ -336,7 +336,7 @@ python inference_flux.py \
 ```
 参数说明：
 - use_quant: 指定使用量化模型
-- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+- quant_type: 量化类型，有w8a16、w8a8_dynamic、w8a8_mxfp8三个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
 ### 4.4 Atlas-800I-A2-64g单卡w8a8_dynamic量化推理性能测试
@@ -410,7 +410,7 @@ python inference_flux.py \
 ```
 参数说明：
 - use_quant: 指定使用量化模型
-- quant_type: 量化类型，有w8a16、w8a8_dynamic两个选项
+- quant_type: 量化类型，有w8a16、w8a8_dynamic、w8a8_mxfp8三个选项
 其余参数说明参照Atlas-800I-A2-64g参数说明
 
 ### 4.5 A5单卡w8a8_mxfp8量化推理性能测试
