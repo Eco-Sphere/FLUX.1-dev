@@ -49,26 +49,7 @@ chmod +x ./Ascend-cann-kernels-{soc}_{version}_linux.run
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-### 2.3 安装MindIE SD
-安装方式详见[开发者指南](https://gitcode.com/Ascend/MindIE-SD/blob/v2.3.0/docs/%E5%BC%80%E5%8F%91%E8%80%85%E6%8C%87%E5%8D%97.md)
-
-### 2.4 Torch_npu安装
-安装pytorch框架 版本2.1.0
-[安装包下载](https://download.pytorch.org/whl/cpu/torch/)
-
-使用pip安装
-```shell
-# {version}表示软件版本号，{arch}表示CPU架构。
-pip install torch-${version}-cp311-cp311-linux_${arch}.whl
-```
-下载 pytorch_v{pytorchversion}_py{pythonversion}.tar.gz
-```shell
-tar -xzvf pytorch_v{pytorchversion}_py{pythonversion}.tar.gz
-# 解压后，会有whl包
-pip install torch_npu-{pytorchversion}.xxxx.{arch}.whl
-```
-
-### 2.5 安装gcc、g++
+### 2.3 安装gcc、g++
 ```shell
 # 若环境镜像中没有gcc、g++，请用户自行安装
 yum install gcc
@@ -78,15 +59,20 @@ yum install g++
 export CPLUS_INCLUDE_PATH=/usr/include/c++/12/:/usr/include/c++/12/aarch64-openEuler-linux/:$CPLUS_INCLUDE_PATH
 ```
 
-### 2.6 下载本仓库
+### 2.4 下载本仓库
 ```shell
 git clone https://modelers.cn/MindIE/FLUX.1-dev.git
 ```
 
-### 2.7 安装所需依赖
+### 2.5 安装所需依赖
 ```shell
 pip install -r requirements.txt
 ```
+
+### 2.6 安装MindIE SD
+安装方式详见[开发者指南](https://gitcode.com/Ascend/MindIE-SD/blob/dev/docs/zh/developer_guide.md)
+
+
 
 ## 三、模型权重
 
