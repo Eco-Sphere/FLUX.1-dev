@@ -259,8 +259,10 @@ def initialize_pipeline(args):
                     if name not in ["transformer_blocks", "single_transformer_blocks"]:
                         module.to(device)
 
+    """
     if bool(os.environ.get("USE_NZ", 0)):
         transfer_nd_to_nz(pipe)
+    """
 
     cp_level = int(os.environ.get("CV_PARALLEL_LEVEL", 0))
     init_cv_parallel(cp_level)
@@ -270,6 +272,45 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.npu.manual_seed(seed)
     torch.npu.manual_seed_all(seed)
+
+def profiling_sample():
+    if os.getenv("PROFILING_ENABLE", "0") == "1":
+        profiling_dir = os.getenv("PROFILING_DIR", "./prof")
+        if int(os.getenv("PROFILING_LEVEL", "0")) == 1:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level1
+        elif int(os.getenv("PROFILING_LEVEL", "0")) == 2:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level2
+        else:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level0
+        profiling_python_stack = True if int(os.getenv("PROFILING_PYTHON_STACK", "0")) == 1 else False
+        
+        logging.info(f"Profiling level: {profiling_level}")
+        logging.info(f"Profiling python stack: {profiling_python_stack}")
+        logging.info(f"Profiling dir: {profiling_dir}")
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=profiling_level,
+            l2_cache=False,
+            data_simplification=False
+        )
+        prof = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=profiling_python_stack,
+            record_shapes=True,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1, warmup=2, active=1, repeat=1, skip_first=0),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profiling_dir)
+        )
+        prof.__enter__()
+
+        return prof
+    else:
+        return None
+
+
 def infer(args):
     set_seed(args.seed)
 
@@ -281,12 +322,14 @@ def infer(args):
     check_param_valid(args.height, args.width, args.infer_steps)
 
     if args.prompt_path is None:  
-        total_nums = 6
+        total_nums = 4
         warmup_nums = 3
         time_consume = 0.0
 
+        prof = profiling_sample()
+
         for i in range(total_nums):
-            prompts = [args.prompt]
+            prompts = [args.prompt] * int(args.batch_size)
             torch.npu.synchronize()
             start_time = time.time()
             image = pipe(
@@ -305,13 +348,19 @@ def infer(args):
             if i > (warmup_nums - 1):
                 time_consume += end_time
 
-            if torch.distributed.is_initialized():
-                if torch.distributed.get_rank() == 0:
-                    image_save_path = os.path.join(args.save_path, f"{i}.png")
-                    image[0][0].save(image_save_path)
-            else:
-                image_save_path = os.path.join(args.save_path, f"{i}.png")
-                image[0][0].save(image_save_path)
+                if int(os.getenv("RANK", 0)) == 0:
+                    for idx, image in enumerate(image.images):
+                        path = f'results/flux-dev-{args.height}x{args.width}_bs{args.batch_size}_time{end_time}s'
+                        fodler = os.makedirs(path, exist_ok=True)
+                        save_path = f'{path}/{idx+1}.png'
+                        image.save(save_path)
+                        print(f'save image: {save_path}')
+            
+            if prof:
+                prof.step()
+
+        if prof is not None:
+            prof.__exit__(None, None, None)
 
         print(f"Average inference time is: {time_consume / (total_nums - warmup_nums)}")
 

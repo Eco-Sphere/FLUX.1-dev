@@ -53,7 +53,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 安装方式详见[developer_guide](https://gitcode.com/Ascend/MindIE-SD/blob/master/docs/developer_guide.md)
 源码编译
 ```shell
-git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD && git checkout dev
+# git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD && git checkout dev
+git clone https://gitcode.com/zt0303003/MindIE-SD_Open.git && cd MindIE-SD_Open && git checkout optim_test
 python3 setup.py bdist_wheel
 ```
 安装
