@@ -1,0 +1,33 @@
+name: Sync from Public External Repo
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs every day at midnight UTC
+  workflow_dispatch: # Allows you to trigger the sync manually via a button
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    # This ensures the built-in GitHub token has permission to push code
+    permissions:
+      contents: write 
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Add remote and fetch
+        run: |
+          git remote add source-repo https://modelers.cn/MindIE/FLUX.1-dev.git
+          git fetch source-repo
+
+      - name: Merge and Push
+        run: |
+          git checkout main
+          # Merges the changes from the public repo into your GitHub repo
+          git merge source-repo/main --allow-unrelated-histories
+          # Pushes the updated code back to GitHub using the built-in token
+          git push origin main
